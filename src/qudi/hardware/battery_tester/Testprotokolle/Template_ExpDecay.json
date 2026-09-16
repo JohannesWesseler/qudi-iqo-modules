@@ -1,0 +1,1422 @@
+{
+    "version": 2.1,
+    "globals": [
+        {
+            "name": "V_CHARGE1",
+            "value": 4.2,
+            "unit": "V"
+        },
+        {
+            "name": "V_DISCHARGE1",
+            "value": 2.8,
+            "unit": "V"
+        },
+        {
+            "name": "I_CUTOFF_CHARGE",
+            "value": 0.02,
+            "unit": "CA"
+        },
+        {
+            "name": "MEMORY1",
+            "value": 10,
+            "unit": "Ah"
+        },
+        {
+            "name": "MEMORY2",
+            "value": 5,
+            "unit": "s"
+        },
+        {
+            "name": "MEMORY3",
+            "value": 1,
+            "unit": "s"
+        },
+        {
+            "name": "MEMORY4",
+            "value": 10,
+            "unit": "A"
+        },
+        {
+            "name": "MEMORY5",
+            "value": 0,
+            "unit": "A"
+        },
+        {
+            "name": "MEMORY6",
+            "value": 0,
+            "unit": " "
+        },
+        {
+            "name": "MEMORY7",
+            "value": 0,
+            "unit": "mA"
+        },
+        {
+            "name": "MEMORY8",
+            "value": 5,
+            "unit": " "
+        },
+        {
+            "name": "MEMORY9",
+            "value": 3.55,
+            "unit": "V"
+        }
+    ],
+    "steps": [
+        {
+            "id": 1,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "value": 5,
+                        "unit": "min",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 2,
+            "type": "SET_VARIABLES",
+            "content": {
+                "parameters": [
+                    {
+                        "parameter": "MEMORY9",
+                        "operator": "=",
+                        "variable": "V",
+                        "value": "100%",
+                        "unit": ""
+                    }
+                ]
+            }
+        },
+        {
+            "id": 3,
+            "type": "DISCHARGE_CCCV",
+            "content": {
+                "parameters": [
+                    {
+                        "property": "I",
+                        "value": 0.333333,
+                        "unit": "CA"
+                    },
+                    {
+                        "property": "V",
+                        "global": "V_DISCHARGE1",
+                        "value": "100%",
+                        "unit": ""
+                    },
+                    {
+                        "property": "I_initial",
+                        "value": 0.333333,
+                        "unit": "CA"
+                    }
+                ],
+                "endConditions": [
+                    {
+                        "property": "I",
+                        "operator": "<",
+                        "action": "NEXT",
+                        "global": "I_CUTOFF_CHARGE",
+                        "value": "100%",
+                        "unit": "",
+                        "delayValue": 100,
+                        "delayUnit": "ms"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 4,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "action": "NEXT",
+                        "value": 15,
+                        "unit": "min"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 5,
+            "type": "LOOP_START",
+            "repetitions": 1,
+            "steps": [
+                {
+                    "id": 6,
+                    "type": "CHARGE_CC",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "value": 0.5,
+                                "unit": "CA"
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "V",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "Q_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "MEMORY1",
+                                "value": "80%",
+                                "unit": ""
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 7,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 15,
+                                "unit": "min"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 8,
+                    "type": "DISCHARGE_CCCV",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "value": 0.333333,
+                                "unit": "CA"
+                            },
+                            {
+                                "property": "V",
+                                "global": "V_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "I_initial",
+                                "value": 0.333333,
+                                "unit": "CA"
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "I",
+                                "operator": "<",
+                                "action": "NEXT",
+                                "global": "I_CUTOFF_CHARGE",
+                                "value": "100%",
+                                "unit": "",
+                                "delayValue": 100,
+                                "delayUnit": "ms"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 9,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 15,
+                                "unit": "min"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": 10,
+            "type": "LOOP_END"
+        },
+        {
+            "id": 11,
+            "type": "SET_VARIABLES",
+            "content": {
+                "parameters": [
+                    {
+                        "parameter": "Cnt_user",
+                        "operator": "=",
+                        "value": 0,
+                        "unit": " "
+                    }
+                ]
+            }
+        },
+        {
+            "id": 12,
+            "type": "LOOP_START",
+            "repetitions": 1,
+            "steps": [
+                {
+                    "id": 13,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "Q_user",
+                                "operator": "=",
+                                "value": 0,
+                                "unit": "Ah"
+                            },
+                            {
+                                "parameter": "Cnt_user",
+                                "operator": "+=",
+                                "value": 1,
+                                "unit": " "
+                            }
+                        ],
+                        "comment": "MEMORY variables:\nMEMORY1 = Real capacity of the cell (in Ah)\nMEMORY2 = MEMORY8 = Step duration (in s)\nMEMORY3 = Record interval (in s)\nMEMORY4 = Current at 1C of real capacity (in A)\nMEMORY5 = Starting current of each interval > current of each step (in A) --> define for each step!\nMEMORY6 = C-rate slope of each interval (in 1/h per h) --> define for each step!\nMEMORY7 = Current step size (in A) --> automatically calculated\nMEMORY9 = Initial voltage to which cell is finally charged again --> automatically calculated"
+                    }
+                },
+                {
+                    "id": 14,
+                    "type": "CHARGE_CC",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "value": 0.5,
+                                "unit": "CA"
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "V",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "Q_user",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "MEMORY1",
+                                "value": "10%",
+                                "unit": ""
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 15,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 15,
+                                "unit": "min"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 16,
+                    "type": "CHARGE_CC",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "MEMORY1",
+                                "value": "16.7%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "V",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 5,
+                                "unit": "s"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "global": "MEMORY3",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 17,
+                    "type": "CHARGE_CC",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "MEMORY1",
+                                "value": "70%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "V",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 5,
+                                "unit": "s"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "global": "MEMORY3",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 18,
+                    "type": "CHARGE_CC",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "MEMORY1",
+                                "value": "136.6%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "V",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 5,
+                                "unit": "s"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "global": "MEMORY3",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 19,
+                    "type": "CHARGE_CC",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "MEMORY1",
+                                "value": "166.7%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "V",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "Q_user",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "global": "MEMORY1",
+                                "value": "35.52%",
+                                "unit": ""
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "global": "MEMORY3",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ],
+                        "comment": "Constant current phase at 1.667C of real capacity"
+                    }
+                },
+                {
+                    "id": 20,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY5",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "164.8%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "=",
+                                "value": 6311000,
+                                "unit": " "
+                            }
+                        ],
+                        "comment": "Step 1"
+                    }
+                },
+                {
+                    "id": 21,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "*=",
+                                "variable": "MEMORY8",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "/=",
+                                "value": 3600,
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "*=",
+                                "variable": "MEMORY6",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "/=",
+                                "value": 1000000,
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 22,
+                    "type": "LOOP_START",
+                    "repetitions": 0,
+                    "steps": [
+                        {
+                            "id": 23,
+                            "type": "CHARGE_CC",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "property": "I",
+                                        "global": "MEMORY5",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "endConditions": [
+                                    {
+                                        "property": "V",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "V_CHARGE1",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "t_step",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "MEMORY2",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "Q_user",
+                                        "operator": ">",
+                                        "action": "EXIT_LOOP",
+                                        "global": "MEMORY1",
+                                        "value": "40.42%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "recordIntervals": [
+                                    {
+                                        "property": "dt",
+                                        "global": "MEMORY3",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "id": 24,
+                            "type": "SET_VARIABLES",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "parameter": "MEMORY5",
+                                        "operator": "-=",
+                                        "variable": "MEMORY7",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": 25,
+                    "type": "LOOP_END"
+                },
+                {
+                    "id": 26,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY5",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "144.8%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "=",
+                                "value": 4191000,
+                                "unit": " "
+                            }
+                        ],
+                        "comment": "Step 2"
+                    }
+                },
+                {
+                    "id": 27,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "*=",
+                                "variable": "MEMORY8",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "/=",
+                                "value": 3600,
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "*=",
+                                "variable": "MEMORY6",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "/=",
+                                "value": 1000000,
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 28,
+                    "type": "LOOP_START",
+                    "repetitions": 0,
+                    "steps": [
+                        {
+                            "id": 29,
+                            "type": "CHARGE_CC",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "property": "I",
+                                        "global": "MEMORY5",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "endConditions": [
+                                    {
+                                        "property": "V",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "V_CHARGE1",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "t_step",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "MEMORY2",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "Q_user",
+                                        "operator": ">",
+                                        "action": "EXIT_LOOP",
+                                        "global": "MEMORY1",
+                                        "value": "48.85%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "recordIntervals": [
+                                    {
+                                        "property": "dt",
+                                        "global": "MEMORY3",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "id": 30,
+                            "type": "SET_VARIABLES",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "parameter": "MEMORY5",
+                                        "operator": "-=",
+                                        "variable": "MEMORY7",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": 31,
+                    "type": "LOOP_END"
+                },
+                {
+                    "id": 32,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY5",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "117.9%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "=",
+                                "value": 2714000,
+                                "unit": " "
+                            }
+                        ],
+                        "comment": "Step 3"
+                    }
+                },
+                {
+                    "id": 33,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "*=",
+                                "variable": "MEMORY8",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "/=",
+                                "value": 3600,
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "*=",
+                                "variable": "MEMORY6",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "/=",
+                                "value": 1000000,
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 34,
+                    "type": "LOOP_START",
+                    "repetitions": 0,
+                    "steps": [
+                        {
+                            "id": 35,
+                            "type": "CHARGE_CC",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "property": "I",
+                                        "global": "MEMORY5",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "endConditions": [
+                                    {
+                                        "property": "V",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "V_CHARGE1",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "t_step",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "MEMORY2",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "Q_user",
+                                        "operator": ">",
+                                        "action": "EXIT_LOOP",
+                                        "global": "MEMORY1",
+                                        "value": "58.99%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "recordIntervals": [
+                                    {
+                                        "property": "dt",
+                                        "global": "MEMORY3",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "id": 36,
+                            "type": "SET_VARIABLES",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "parameter": "MEMORY5",
+                                        "operator": "-=",
+                                        "variable": "MEMORY7",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": 37,
+                    "type": "LOOP_END"
+                },
+                {
+                    "id": 38,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY5",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "91.9%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "=",
+                                "value": 1567000,
+                                "unit": " "
+                            }
+                        ],
+                        "comment": "Step 4"
+                    }
+                },
+                {
+                    "id": 39,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "*=",
+                                "variable": "MEMORY8",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "/=",
+                                "value": 3600,
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "*=",
+                                "variable": "MEMORY6",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "/=",
+                                "value": 1000000,
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 40,
+                    "type": "LOOP_START",
+                    "repetitions": 0,
+                    "steps": [
+                        {
+                            "id": 41,
+                            "type": "CHARGE_CC",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "property": "I",
+                                        "global": "MEMORY5",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "endConditions": [
+                                    {
+                                        "property": "V",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "V_CHARGE1",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "t_step",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "MEMORY2",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "Q_user",
+                                        "operator": ">",
+                                        "action": "EXIT_LOOP",
+                                        "global": "MEMORY1",
+                                        "value": "69.62%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "recordIntervals": [
+                                    {
+                                        "property": "dt",
+                                        "global": "MEMORY3",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "id": 42,
+                            "type": "SET_VARIABLES",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "parameter": "MEMORY5",
+                                        "operator": "-=",
+                                        "variable": "MEMORY7",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": 43,
+                    "type": "LOOP_END"
+                },
+                {
+                    "id": 44,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY5",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "72%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "=",
+                                "value": 947000,
+                                "unit": " "
+                            }
+                        ],
+                        "comment": "Step 5"
+                    }
+                },
+                {
+                    "id": 45,
+                    "type": "SET_VARIABLES",
+                    "content": {
+                        "parameters": [
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "*=",
+                                "variable": "MEMORY8",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY6",
+                                "operator": "/=",
+                                "value": 3600,
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "=",
+                                "variable": "MEMORY4",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "*=",
+                                "variable": "MEMORY6",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "parameter": "MEMORY7",
+                                "operator": "/=",
+                                "value": 1000000,
+                                "unit": ""
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 46,
+                    "type": "LOOP_START",
+                    "repetitions": 0,
+                    "steps": [
+                        {
+                            "id": 47,
+                            "type": "CHARGE_CC",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "property": "I",
+                                        "global": "MEMORY5",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "endConditions": [
+                                    {
+                                        "property": "V",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "V_CHARGE1",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "t_step",
+                                        "operator": ">",
+                                        "action": "NEXT",
+                                        "global": "MEMORY2",
+                                        "value": "100%",
+                                        "unit": ""
+                                    },
+                                    {
+                                        "property": "Q_user",
+                                        "operator": ">",
+                                        "action": "EXIT_LOOP",
+                                        "global": "MEMORY1",
+                                        "value": "80%",
+                                        "unit": ""
+                                    }
+                                ],
+                                "recordIntervals": [
+                                    {
+                                        "property": "dt",
+                                        "global": "MEMORY3",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "id": 48,
+                            "type": "SET_VARIABLES",
+                            "content": {
+                                "parameters": [
+                                    {
+                                        "parameter": "MEMORY5",
+                                        "operator": "-=",
+                                        "variable": "MEMORY7",
+                                        "value": "100%",
+                                        "unit": ""
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": 49,
+                    "type": "LOOP_END"
+                },
+                {
+                    "id": 50,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 15,
+                                "unit": "min"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 51,
+                    "type": "DISCHARGE_CCCV",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "value": 0.333333,
+                                "unit": "CA"
+                            },
+                            {
+                                "property": "V",
+                                "global": "V_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "I_initial",
+                                "value": 0.333333,
+                                "unit": "CA"
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "I",
+                                "operator": "<",
+                                "action": "NEXT",
+                                "global": "I_CUTOFF_CHARGE",
+                                "value": "100%",
+                                "unit": "",
+                                "delayValue": 100,
+                                "delayUnit": "ms"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 52,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "action": "NEXT",
+                                "value": 15,
+                                "unit": "min"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": 53,
+            "type": "LOOP_END"
+        },
+        {
+            "id": 54,
+            "type": "CHARGE_CCCV",
+            "content": {
+                "parameters": [
+                    {
+                        "property": "I",
+                        "value": 0.5,
+                        "unit": "CA"
+                    },
+                    {
+                        "property": "V",
+                        "global": "MEMORY9",
+                        "value": "100%",
+                        "unit": ""
+                    },
+                    {
+                        "property": "I_initial",
+                        "value": 0.5,
+                        "unit": "CA"
+                    }
+                ],
+                "endConditions": [
+                    {
+                        "property": "I",
+                        "operator": "<",
+                        "global": "I_CUTOFF_CHARGE",
+                        "value": "100%",
+                        "unit": "",
+                        "delayValue": 100,
+                        "delayUnit": "ms",
+                        "action": "NEXT"
+                    },
+                    {
+                        "property": "V",
+                        "operator": ">",
+                        "global": "V_CHARGE1",
+                        "value": "100%",
+                        "unit": "",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 55,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "action": "NEXT",
+                        "value": 15,
+                        "unit": "min"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        }
+    ]
+}

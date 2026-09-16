@@ -2,14 +2,13 @@
 """
 Red Pitaya Data Input Streaming Module for Qudi.
 
-This module provides continuous data streaming from the Red Pitaya using
-pyrpl's scan module in *push* stream mode. It implements the qudi
-DataInStreamInterface for efficient continuous data acquisition at
-125MHz/4096 ~ 30.5 kHz.
+This module provides continuous data streaming from the dedicated PyRPL
+Region-11 data streamer. It implements Qudi's DataInStreamInterface at the
+demodulator rate reported by the loaded FPGA image.
 
 Architecture:
-- Uses pyrpl scan module's ARM-side-drain + TCP-push streaming
-  (``scan.push_stream_start/read/stop``). The real-time deadline lives on the
+- Uses PyRPL Region-11's ARM-side-drain + TCP-push event streaming
+  (``datastreamer.subscribe/unsubscribe``). The real-time deadline lives on the
   Red Pitaya ARM core, not on this PC, so GC pauses / Qt event-loop stalls /
   network jitter no longer cause data loss.
 - A background receiver thread on the PC (pyrpl ``StreamClient``) drains the
@@ -19,7 +18,7 @@ Architecture:
   **NaN-filled** so the time axis stays truthful -- never silently dropped.
 - Supports both CONTINUOUS and FINITE streaming modes
 
-See ``docs/developer_guide/scan_push_streaming.md`` in the pyrpl repo for the
+See ``docs/developer_guide/streaming_architecture.md`` in the pyrpl repo for the
 full design and wire protocol.
 
 Example config:
@@ -50,7 +49,7 @@ Usage Example:
         active_channels=['ch1'],
         streaming_mode=StreamingMode.CONTINUOUS,
         channel_buffer_size=100000,
-        sample_rate=30517
+        sample_rate=<value reported in the activation log>
     )
 
     # Start stream
@@ -66,7 +65,7 @@ Usage Example:
     stream.stop_stream()
 
 Performance:
-    - Fixed sample rate: ~30.517 kHz (125 MHz / 4096 FPGA decimation)
+    - Sample rate and decimation are read from FPGA capability registers
     - ARM-side drain + TCP push keeps the real-time deadline off the PC; the
       receiver thread tolerates PC-side stalls (socket buffers ~1 s headroom)
     - No data loss under normal load; genuine overruns are NaN-filled and logged
@@ -90,13 +89,12 @@ from .resource_manager import get_pyrpl_instance, release_pyrpl_instance
 
 class RedPitayaDataInStream(DataInStreamInterface):
     """
-    Red Pitaya continuous data streaming using pyrpl scan module.
+    Red Pitaya continuous data streaming using PyRPL's dedicated streamer.
 
-    Provides high-speed continuous streaming of demodulated lock-in data
-    at fixed ~30.517 kHz sample rate (125 MHz / 4096 decimation).
+    Provides continuous demodulated or correction data at the rate advertised
+    by the loaded lock-in/tracker profile.
 
-    The module uses pyrpl's scan module in *push* stream mode: the Red Pitaya
-    ARM core continuously drains the 4096-sample FPGA ring buffer and pushes
+    The Red Pitaya ARM core continuously drains the Region-11 FPGA ring and pushes
     framed samples over a dedicated TCP socket. A pyrpl ``StreamClient`` daemon
     thread receives them on the PC; this module pulls from that receiver on
     demand. Lost samples (genuine FPGA-ring overruns only) are NaN-filled rather
@@ -107,6 +105,8 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _redpitaya_config_name = ConfigOption('redpitaya_config_name',
                                           default='rpy_shared_config', missing='info')
     _redpitaya_hostname = ConfigOption('redpitaya_hostname', missing='error')
+    _redpitaya_fpga_filename = ConfigOption(
+        'redpitaya_fpga_filename', default=None, missing='info')
     _calibration_factor = ConfigOption('calibration_factor', default=1.0, missing='info')
     _signal_scale = ConfigOption('signal_scale', default=1.0, missing='info')
     _default_buffer_size = ConfigOption('channel_buffer_size', default=100000, missing='info')
@@ -115,7 +115,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _max_fpga_read_samples = ConfigOption('max_fpga_read_samples', default=None, missing='info')
     _stream_input = ConfigOption('stream_input', default='demod', missing='info')
 
-    # Push-streaming headroom tuning (passed to scan.push_stream_start):
+    # Push-streaming headroom tuning (passed to datastreamer.subscribe):
     #   stream_ring_bytes : ARM-side DRAM ring size, sets how long a PC stall can
     #                       last before any sample is lost (ring_bytes/wire_rate
     #                       seconds). 0 = pyrpl default (16 MB ~ tens of seconds).
@@ -134,16 +134,12 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='2kHz_minphase', missing='info')
     _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='2kHz_minphase', missing='info')
 
-    # FPGA constants from pyrpl scan module
-    _FPGA_CLOCK_FREQ = 125e6  # Hz
-    _DEMOD_DECIMATION = 4096
-    _STREAM_SAMPLE_RATE = _FPGA_CLOCK_FREQ / _DEMOD_DECIMATION  # ~30.517 kHz
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._pyrpl = None
         self._scan_module = None
+        self._data_streamer = None
         self._thread_lock = RecursiveMutex()
 
         # Constraints
@@ -153,7 +149,10 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._active_channels = []
         self._streaming_mode = StreamingMode.INVALID
         self._channel_buffer_size = 0
-        self._sample_rate = self._STREAM_SAMPLE_RATE
+        self._fpga_clock_freq = 0
+        self._demod_decimation = 0
+        self._stream_sample_rate = 0.0
+        self._sample_rate = 0.0
         self._current_stream_input = 'demod'  # Current input: 'demod' or 'ftw_corr'
 
         # KDC_HW_SYNC handover state: the board streams ONE quantity at a time, so a
@@ -163,6 +162,11 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._scan_resume = False
         self._scan_resume_input = 'demod'
         self._scan_tap = None        # display tap into the scan's feed (fan-out)
+        self._scan_reader = None
+        self._scan_events = None
+        self._scan_data_source = 'fir'
+        self._scan_x_seen = 0
+        self._scan_y_seen = 0
 
         # Push-streaming receiver (pyrpl StreamClient) + a small FIFO of samples
         # already drained from it but not yet handed to the consumer. The
@@ -183,12 +187,26 @@ class RedPitayaDataInStream(DataInStreamInterface):
             # Get shared pyrpl instance
             self._pyrpl, _ = get_pyrpl_instance(
                 hostname=self._redpitaya_hostname,
-                config_name=self._redpitaya_config_name
+                config_name=self._redpitaya_config_name,
+                fpga_filename=self._redpitaya_fpga_filename
             )
             self.log.info(f'Acquired shared pyrpl instance for {self._redpitaya_hostname}')
 
             # Get scan module (will be used in stream mode)
             self._scan_module = self._pyrpl.rp.scan
+            self._data_streamer = self._pyrpl.rp.datastreamer
+
+            lock_in = self._pyrpl.rp.lockin
+            lock_caps = lock_in.require_compatible_firmware()
+            stream_caps = self._data_streamer.require_compatible_firmware()
+            self._fpga_clock_freq = int(lock_caps['fpga_clock_hz'])
+            self._demod_decimation = int(lock_caps['sample_period_cycles'])
+            self._stream_sample_rate = float(lock_caps['sample_rate'])
+            if int(stream_caps['timestamp_clock_hz']) != self._fpga_clock_freq:
+                raise RuntimeError(
+                    'Lock-in and data-streamer clock capabilities disagree: '
+                    f'{self._fpga_clock_freq} vs '
+                    f'{stream_caps["timestamp_clock_hz"]} Hz')
 
             # Set initial stream input mode from config
             self._current_stream_input = self._stream_input
@@ -211,9 +229,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
                     increment=1
                 ),
                 sample_rate=ScalarConstraint(
-                    default=self._STREAM_SAMPLE_RATE,
-                    bounds=(self._STREAM_SAMPLE_RATE * 0.99,
-                           self._STREAM_SAMPLE_RATE * 1.01),  # Narrow range (fixed)
+                    default=self._stream_sample_rate,
+                    bounds=(self._stream_sample_rate * 0.99,
+                           self._stream_sample_rate * 1.01),  # Narrow range (fixed)
                     increment=0
                 )
             )
@@ -223,11 +241,14 @@ class RedPitayaDataInStream(DataInStreamInterface):
                 active_channels=['ch1'],
                 streaming_mode=StreamingMode.CONTINUOUS,
                 channel_buffer_size=self._default_buffer_size,
-                sample_rate=self._STREAM_SAMPLE_RATE
+                sample_rate=self._stream_sample_rate
             )
 
             self.log.info('Red Pitaya data instream module activated')
-            self.log.info(f'Sample rate: {self._STREAM_SAMPLE_RATE:.1f} Hz (fixed)')
+            self.log.info(
+                'Sample rate: %.6f Hz (FPGA clock=%d Hz, period=%d clocks)',
+                self._stream_sample_rate, self._fpga_clock_freq,
+                self._demod_decimation)
 
         except Exception as e:
             self.log.error(f'Failed to activate Red Pitaya instream: {e}')
@@ -267,19 +288,28 @@ class RedPitayaDataInStream(DataInStreamInterface):
             lock_in.fir_bypass_ch1 = self._lock_in_fir_bypass_ch1
             lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
 
-            # Configure filter selection (only active when FIR bypass is False)
-            valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
+            # Derive selections from the loaded FPGA profile. This prevents an
+            # invalid config from falling back to a FIR that was compiled out of
+            # the resource-reduced fast image.
+            valid_filters = {
+                name for name, available in lock_in.filter_capabilities.items()
+                if available and name != 'fir_bypass'}
+            if '2kHz_minphase' in valid_filters:
+                valid_filters.add('2kHz')  # legacy alias
+            fallback_filter = ('2kHz_minphase'
+                               if '2kHz_minphase' in valid_filters
+                               else next(iter(sorted(valid_filters))))
 
             if self._lock_in_filter_ch1 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
-                                 f'Using "2kHz_minphase". Valid options: {valid_filters}')
-                self._lock_in_filter_ch1 = '2kHz_minphase'
+                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
+                self._lock_in_filter_ch1 = fallback_filter
             lock_in.filter_select_ch1 = self._lock_in_filter_ch1
 
             if self._lock_in_filter_ch2 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
-                                 f'Using "2kHz_minphase". Valid options: {valid_filters}')
-                self._lock_in_filter_ch2 = '2kHz_minphase'
+                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
+                self._lock_in_filter_ch2 = fallback_filter
             lock_in.filter_select_ch2 = self._lock_in_filter_ch2
 
             # Log configuration summary
@@ -364,6 +394,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
             if self._scan_module is not None:
                 self._scan_module.input_select = input_mode
                 if self._running:
+                    if not self._scan_active and self._data_streamer is not None:
+                        source = 'fir' if input_mode == 'demod' else 'correction'
+                        self._data_streamer.update_subscription(self._rx, (source,))
                     self.log.info(f'Stream input switched live to: {input_mode}')
                 else:
                     self.log.info(f'Stream input set to: {input_mode} (FPGA register updated)')
@@ -409,9 +442,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
             if not self._constraints.sample_rate.is_valid(sample_rate):
                 self.log.warning(
                     f'Sample rate {sample_rate:.1f} Hz out of range. '
-                    f'Using fixed FPGA rate {self._STREAM_SAMPLE_RATE:.1f} Hz'
+                    f'Using fixed FPGA rate {self._stream_sample_rate:.1f} Hz'
                 )
-                sample_rate = self._STREAM_SAMPLE_RATE
+                sample_rate = self._stream_sample_rate
 
             # Apply configuration
             self._active_channels = active_channels
@@ -429,26 +462,10 @@ class RedPitayaDataInStream(DataInStreamInterface):
     def start_stream(self) -> None:
         """Start the data acquisition/streaming.
 
-        While a KDC_HW_SYNC scan owns the board's single stream, this does NOT
-        start a competing stream (which would reset the shared counter and break
-        the scan). Instead it attaches a read-only *tap* to the scan's live feed,
-        so a time-trace can display the SAME samples the scan is binning.
+        Region-11 subscriptions are multiplexed, so a time trace and motor scan
+        can run concurrently without either resetting the other's ring.
         """
         with self._thread_lock:
-            if self._scan_active:
-                if self._rx is None or not getattr(self._rx, 'running', False):
-                    self._scan_tap = self._scan_module.add_stream_tap()
-                    self._rx = self._scan_tap
-                self._pending = np.empty(0, dtype=np.float64)
-                self._total_samples_acquired = 0
-                self._last_gap_reported = 0
-                self._running = True
-                if self.module_state() != 'locked':
-                    self.module_state.lock()
-                self.log.info('Time-trace attached to the running scan stream (tap, '
-                              f'input={self._current_stream_input}).')
-                return
-
             assert self.module_state() == 'idle', \
                 'Stream already running'
             assert self._streaming_mode != StreamingMode.INVALID, \
@@ -464,8 +481,10 @@ class RedPitayaDataInStream(DataInStreamInterface):
                 # stream engine, lazily deploys+starts the ARM server, and starts
                 # the PC-side receiver thread. Returns the StreamClient. The ring
                 # size sets the PC-stall headroom (see config options above).
-                self._rx = self._scan_module.push_stream_start(
-                    input_source=self._current_stream_input,
+                source = ('fir' if self._current_stream_input == 'demod'
+                          else 'correction')
+                self._rx = self._data_streamer.subscribe(
+                    sources=(source,),
                     ring_bytes=int(self._stream_ring_bytes),
                     coalesce_us=int(self._stream_coalesce_us))
 
@@ -490,20 +509,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
         FIFO so a consumer can read the tail after stopping; the FIFO is cleared
         on the next ``start_stream``.
 
-        While a scan owns the stream, this only detaches the display tap -- the
-        scan's stream is left running untouched.
+        Other Region-11 subscribers remain active.
         """
         with self._thread_lock:
-            if self._scan_active:
-                if self._scan_tap is not None:
-                    self._scan_module.remove_stream_tap(self._scan_tap)
-                    self._scan_tap = None
-                self._rx = None
-                self._running = False
-                if self.module_state() == 'locked':
-                    self.module_state.unlock()
-                self.log.info('Time-trace detached from scan stream (scan continues).')
-                return
             self._do_stop()
 
     def _do_stop(self) -> None:
@@ -519,7 +527,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
         try:
             # Stops the PC receiver thread AND disables the FPGA stream engine.
             # Leaves the ARM server running for fast restarts.
-            self._scan_module.push_stream_stop()
+            self._data_streamer.unsubscribe(self._rx)
             # Drain whatever the receiver buffered before it was stopped so the
             # consumer can still read the tail.
             self._drain_rx()
@@ -558,110 +566,69 @@ class RedPitayaDataInStream(DataInStreamInterface):
         return self._scan_active
 
     def begin_scan_stream(self, input_source='ftw_corr', ring_bytes=0, coalesce_us=0):
-        """Hand the single board stream to a marker-mode (MODE 3) motor scan.
-
-        The scan becomes the sole socket reader (marker mode) on ``input_source``.
-        If a monitor stream (time-series / ODMR tracking) was running, this module
-        seamlessly switches its read path to a tap on the scan's feed so the display
-        continues uninterrupted. Returns the pyrpl scan module. Pair with
-        end_scan_stream().
-        """
+        """Subscribe a motor scan to data and timestamped X/Y position events."""
         with self._thread_lock:
-            if self._scan_module is None:
-                raise RuntimeError('redpitaya_stream not activated; no scan module available')
+            if self._data_streamer is None:
+                raise RuntimeError('redpitaya_stream not activated')
             if input_source not in ('demod', 'ftw_corr'):
                 self.log.warning("Scan stream input '%s' invalid; using 'ftw_corr'.",
                                  input_source)
                 input_source = 'ftw_corr'
-            # Remember whether a monitor was displaying, so we can restore a
-            # standalone monitor stream afterwards.
-            was_running = bool(self._running)
-            self._scan_resume = was_running
-            self._scan_resume_input = self._current_stream_input
-            # Stop the monitor's OWN receiver (the scan will own the single socket);
-            # keep module_state as-is -- we re-point _rx at the scan's tap below so a
-            # running display does not skip a beat.
-            if was_running:
-                try:
-                    self._scan_module.push_stream_stop()
-                except Exception as e:  # noqa: BLE001
-                    self.log.warning('Error stopping monitor receiver for handover: %s', e)
-                self._rx = None
-            # Start marker-mode streaming on the requested quantity. The scan reads
-            # samples + markers from the same pyrpl scan module; we read a tap.
-            try:
-                self._current_stream_input = input_source
-                self._scan_module.input_select = input_source
-                self._scan_module.mapped_stream_start(
-                    input_source=input_source,
-                    ring_bytes=int(ring_bytes) if ring_bytes else int(self._stream_ring_bytes),
-                    coalesce_us=int(coalesce_us) if coalesce_us else int(self._stream_coalesce_us))
-            except Exception:
-                # Don't leave the monitor stranded if the scan stream fails to start.
-                self._scan_active = False
-                if was_running:
-                    try:
-                        self._current_stream_input = self._scan_resume_input
-                        if self.module_state() == 'locked':
-                            self.module_state.unlock()
-                        self._running = False
-                        self.start_stream()
-                        self.log.info('KDC_HW_SYNC: scan stream failed to start; '
-                                      'restored the monitor stream.')
-                    except Exception as e2:  # noqa: BLE001
-                        self.log.error('KDC_HW_SYNC: scan stream failed AND monitor '
-                                       'restore failed: %s', e2)
-                self._scan_resume = False
-                raise
+            self._scan_data_source = 'fir' if input_source == 'demod' else 'correction'
+            sources = {'fir', self._scan_data_source, 'x_position', 'y_position'}
+            self._scan_reader = self._data_streamer.subscribe(
+                tuple(sources), poll_us=50,
+                ring_bytes=int(ring_bytes) if ring_bytes else int(self._stream_ring_bytes),
+                coalesce_us=int(coalesce_us) if coalesce_us else int(self._stream_coalesce_us))
+            self._scan_events = np.empty(0, dtype=self._data_streamer.EVENT_DTYPE)
+            self._scan_x_seen = 0
+            self._scan_y_seen = 0
             self._scan_active = True
-            # If a display was running, attach a tap so it keeps reading seamlessly.
-            if was_running:
-                self._scan_tap = self._scan_module.add_stream_tap()
-                self._rx = self._scan_tap
-                self._pending = np.empty(0, dtype=np.float64)
-                self._total_samples_acquired = 0
-                self._last_gap_reported = 0
-                self._running = True
-            self.log.info("KDC_HW_SYNC scan now owns the push stream (marker mode, "
-                          "input='%s'%s).", input_source,
-                          '; time-trace tapped' if was_running else '')
-            return self._scan_module
+            self.log.info("KDC_HW_SYNC subscribed to Region-11 events (input='%s').",
+                          input_source)
+            return self
 
     def end_scan_stream(self):
-        """Stop the scan's marker stream and restore the standalone monitor stream."""
+        """Remove the motor-scan subscription without disturbing other users."""
         with self._thread_lock:
             if not self._scan_active:
                 return
             self._scan_active = False
-            # Was a display reading the scan's tap? (either resumed monitor or a
-            # time-trace started during the scan)
-            display_active = bool(self._running)
-            resume_input = self._scan_resume_input if self._scan_resume else self._current_stream_input
-            # Drop the tap and the scan's marker stream.
-            if self._scan_tap is not None:
-                try:
-                    self._scan_module.remove_stream_tap(self._scan_tap)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._scan_tap = None
-            self._rx = None
-            self._running = False
-            if self.module_state() == 'locked':
-                self.module_state.unlock()
             try:
-                self._scan_module.mapped_stream_stop()
+                self._data_streamer.unsubscribe(self._scan_reader)
             except Exception as e:  # noqa: BLE001
                 self.log.warning('Error stopping KDC_HW_SYNC scan stream: %s', e)
-            # Restore a standalone monitor stream if anything was (or should be) shown.
-            if self._scan_resume or display_active:
-                try:
-                    self._current_stream_input = resume_input
-                    self.start_stream()  # _scan_active is False -> real start
-                    self.log.info("KDC_HW_SYNC: restored monitor stream (input='%s').",
-                                  self._current_stream_input)
-                except Exception as e:  # noqa: BLE001
-                    self.log.error('Failed to restore monitor stream after scan: %s', e)
-            self._scan_resume = False
+            self._scan_reader = None
+
+    def mapped_stream_read(self):
+        """Return new scalar scan samples while retaining marker metadata."""
+        if self._scan_reader is None:
+            return np.empty(0, dtype=np.float64)
+        events = self._scan_reader.read_events()
+        if events.size:
+            self._scan_events = np.concatenate((self._scan_events, events))
+        return self._data_streamer.select(events, self._scan_data_source)['data'].astype(np.float64)
+
+    def _new_scan_markers(self, axis):
+        if self._scan_events is None or not self._scan_events.size:
+            return np.empty(0, dtype=np.int64)
+        rec = self._data_streamer.reconstruct_tracking(
+            self._scan_events, interval=self._demod_decimation)
+        key = '%s_position' % axis
+        seen_name = '_scan_%s_seen' % axis
+        seen = getattr(self, seen_name)
+        values = rec[key][seen:]
+        setattr(self, seen_name, rec[key].size)
+        return values
+
+    def read_x_markers(self):
+        return self._new_scan_markers('x')
+
+    def read_y_markers(self):
+        return self._new_scan_markers('y')
+
+    def ftw_to_hz(self, values):
+        return self._scan_module.ftw_to_hz(values)
 
     def _drain_rx(self):
         """Pull all samples the receiver has buffered, calibrate them, and append

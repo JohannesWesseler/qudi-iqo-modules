@@ -52,27 +52,35 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 redpitaya_hostname: '10.203.129.28'
                 lock_in_filter_resonance_1: '2kHz_minphase'
                 lock_in_filter_resonance_2: '2kHz_minphase'
+                tracking_algorithm: 'conventional'  # or 'smith_linear'
+                smith_gain_multiplier: 4.0          # increase toward 10 after validation
+                smith_delay_samples: 64
                 max_trace_samples: 2000000   # cap on the high-rate trace buffer
     """
 
     _redpitaya_config_name = ConfigOption('redpitaya_config_name',
                                           default='rpy_shared_config', missing='info')
     _redpitaya_hostname = ConfigOption('redpitaya_hostname', missing='error')
+    _redpitaya_fpga_filename = ConfigOption(
+        'redpitaya_fpga_filename', default=None, missing='info')
     _lock_in_filter_resonance_1 = ConfigOption(
         'lock_in_filter_resonance_1', default='2kHz_minphase', missing='info')
     _lock_in_filter_resonance_2 = ConfigOption(
         'lock_in_filter_resonance_2', default='2kHz_minphase', missing='info')
+    _tracking_algorithm = ConfigOption(
+        'tracking_algorithm', default='conventional', missing='info')
+    _smith_gain_multiplier = ConfigOption(
+        'smith_gain_multiplier', default=4.0, missing='info')
+    _smith_delay_samples = ConfigOption(
+        'smith_delay_samples', default=None, missing='info')
     # Size (in stream WORDS) of the high-rate display buffer for read_traces. It is a
     # ROLLING window: once full, the oldest samples are dropped so the tracking GUI
     # shows the most recent slice at CONSTANT resolution (like the Time Series GUI),
-    # instead of growing unbounded / freezing. In the current marked stream 4 words
-    # = 1 sample (~30.5 kHz), so 2 MWords ~= 500k samples ~= 16.4 s window. Reduce for a shorter,
-    # finer-resolution window. Indefinite drift is still fully covered by the low-rate
+    # instead of growing unbounded / freezing. In Region-11 mode this is interpreted
+    # as an event-record limit. Reduce it for a shorter, finer-resolution window.
+    # Indefinite drift is still fully covered by the low-rate
     # per-slot register polling (get_slot_status / correction-history plot).
     _max_trace_samples = ConfigOption('max_trace_samples', default=2_000_000, missing='nothing')
-
-    # ~30.5 kHz demod/stream sample rate (125 MHz / 4096 CIC decimation)
-    _STREAM_SAMPLE_RATE_HZ = 125e6 / 4096
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -81,23 +89,33 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._multitrack = None
         self._fgen3 = None
         self._scan = None
+        self._streamer = None
+        self._stream_reader = None
+        self._fpga_clock_hz = 0
+        self._sample_period_cycles = 0
+        self._stream_sample_rate_hz = 0.0
         # multi-resonance tracking state
         self._tracking_active = False
         self._streaming_traces = False
         self._single_slot_no_hop = False
         self._nslots = 2
-        self._trace_values = np.array([], dtype=np.float64)
+        self._trace_events = None
+        self._pending_xmarkers = np.empty(0, dtype=np.int64)
+        self._pending_ymarkers = np.empty(0, dtype=np.int64)
+        self._marker_x_seen = 0
+        self._marker_y_seen = 0
         self._trace_ticks = np.array([], dtype=np.int64)
         self._trace_steps = np.array([], dtype=np.int64)
         # Number of complete stream records removed from the front of the rolling
         # buffer.  This preserves an elapsed-since-stream-start time axis.
         self._trace_sample_offset = 0
-        self._stream_words_per_sample = 3  # legacy-safe until the FPGA reports 4
+        # One structured Region-11 event per returned array element.
+        self._stream_words_per_sample = 1
         # Runtime rolling-window size in WORDS for the high-rate display buffer
         # (settable live via set_trace_window_seconds; initialized from the
         # max_trace_samples ConfigOption in on_activate).
         self._trace_window_words = 2_000_000
-        self._stream_source = 'marked'
+        self._stream_source = 'events'
         self._configured_lock_in_filters = ['2kHz_minphase', '2kHz_minphase']
         # 2D motor-scan takeover: while True the motor scan owns the physical stream
         # drain (read_stream_words), so read_traces must NOT also drain (word theft).
@@ -118,7 +136,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         # Get shared PyRPL instance via resource manager
         self._pyrpl, _ = get_pyrpl_instance(
             hostname=self._redpitaya_hostname,
-            config_name=self._redpitaya_config_name
+            config_name=self._redpitaya_config_name,
+            fpga_filename=self._redpitaya_fpga_filename
         )
 
         # Runtime high-rate display window (words), seeded from the ConfigOption.
@@ -131,13 +150,37 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._multitrack = getattr(rp, 'odmrmultitrack', None)
         self._fgen3 = getattr(rp, 'fgen3', None)
         self._scan = getattr(rp, 'scan', None)
-        if self._scan is not None:
-            self._stream_words_per_sample = int(self._scan.stream_words_per_sample)
-            if self._stream_words_per_sample != 4:
-                self.log.warning(
-                    'FPGA reports the legacy %d-word tracking stream; the pre-FIR CIC '
-                    'trace is unavailable until the new bitstream is loaded.',
-                    self._stream_words_per_sample)
+        self._streamer = getattr(rp, 'datastreamer', None)
+        if self._streamer is None:
+            raise RuntimeError(
+                'rp.datastreamer is required; load the matching experiment FPGA image')
+
+        lock0 = rp.lockin
+        lock1 = rp.lockin1
+        lock0_caps = lock0.require_compatible_firmware()
+        lock1_caps = lock1.require_compatible_firmware()
+        tracker_caps = self._lock.require_compatible_firmware()
+        stream_caps = self._streamer.require_compatible_firmware()
+        timing = {(int(c['fpga_clock_hz']), int(c['sample_period_cycles']))
+                  for c in (lock0_caps, lock1_caps, tracker_caps)}
+        if len(timing) != 1:
+            raise RuntimeError(
+                'Lock-in/tracker timing capabilities disagree: %r' % sorted(timing))
+        self._fpga_clock_hz, self._sample_period_cycles = timing.pop()
+        if int(stream_caps['timestamp_clock_hz']) != self._fpga_clock_hz:
+            raise RuntimeError('Tracker and data-streamer timestamp clocks disagree')
+        self._stream_sample_rate_hz = (
+            float(self._fpga_clock_hz) / self._sample_period_cycles)
+        if self._tracking_algorithm not in ('conventional', 'smith_linear'):
+            raise ValueError(
+                f'Invalid tracking_algorithm {self._tracking_algorithm!r}; '
+                'use "conventional" or "smith_linear"')
+        if (self._tracking_algorithm == 'smith_linear' and
+                not tracker_caps.get('algorithms', {}).get('smith_predictor', False)):
+            raise RuntimeError(
+                'tracking_algorithm="smith_linear" requires the matching Smith FPGA image')
+        self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
+        self._stream_words_per_sample = 1
 
         # Multitrack routes resonance 1 through lockin channel 1 and resonance 2
         # through lockin1 channel 1. Configure both instances explicitly.
@@ -145,6 +188,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
         # Ensure lock + oscillator are disabled on activation
         self._lock.enable = False
+        self._lock.smith_enable = False
         if self._multitrack is not None:
             try:
                 self._multitrack.enable = False
@@ -154,30 +198,47 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         if self._multitrack is None:
             self.log.warning('rp.odmrmultitrack not found - multi-resonance tracking '
                              'unavailable (old bitstream?). Single-resonance lock still works.')
-        self.log.info(f'Red Pitaya ODMR Lock connected: {self._redpitaya_hostname}')
+        self.log.info(
+            'Red Pitaya ODMR Lock connected: %s; rate=%.6f Hz, period=%d clocks, '
+            'algorithm=%d', self._redpitaya_hostname, self._stream_sample_rate_hz,
+            self._sample_period_cycles, int(tracker_caps['algorithm_id']))
 
     def _configure_lock_in_filters(self, rp) -> None:
         """Apply the per-resonance FIR phase selection to both lock-in instances."""
-        valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
+        modeled_filter = rp.lockin.smith_filter_name
         requested = [self._lock_in_filter_resonance_1,
                      self._lock_in_filter_resonance_2]
+        if self._tracking_algorithm == 'smith_linear':
+            if requested[0] != modeled_filter:
+                self.log.info(
+                    'Smith tracking overrides resonance-1 FIR selection to %s',
+                    modeled_filter)
+            requested[0] = modeled_filter
 
         for index, (module_name, filter_name) in enumerate(
                 zip(('lockin', 'lockin1'), requested), start=1):
-            if filter_name not in valid_filters:
-                self.log.warning(
-                    f'Invalid lock-in filter for resonance {index}: "{filter_name}"; '
-                    'using "2kHz_minphase"')
-                filter_name = '2kHz_minphase'
-
             lock_in = getattr(rp, module_name, None)
             if lock_in is None:
                 self.log.warning(
                     f'rp.{module_name} not found; cannot configure resonance {index} FIR')
                 continue
 
+            valid_filters = {
+                name for name, available in lock_in.filter_capabilities.items()
+                if available and name != 'fir_bypass'}
+            if '2kHz_minphase' in valid_filters:
+                valid_filters.add('2kHz')  # legacy alias
+            fallback_filter = ('2kHz_minphase'
+                               if '2kHz_minphase' in valid_filters
+                               else next(iter(sorted(valid_filters))))
+
             # Channel 1 is the current multitrack data path. Keep channel 2 in
             # step so it is ready if the unused quadrature lane is enabled later.
+            if filter_name not in valid_filters:
+                self.log.warning(
+                    f'FIR "{filter_name}" is not available in the loaded FPGA '
+                    f'profile; using "{fallback_filter}"')
+                filter_name = fallback_filter
             lock_in.filter_select_ch1 = filter_name
             lock_in.filter_select_ch2 = filter_name
             self._configured_lock_in_filters[index - 1] = (
@@ -192,9 +253,19 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         the selected 32-bit FIR output at DC.  The discriminator fit supplies the
         remaining physical LSB/Hz factor in the tracking logic.
         """
+        # Sensitivity sweeps can change the shared FIR after activation.
+        # Report the current hardware choice, not the initial config file.
+        if self._pyrpl is not None:
+            self._configured_lock_in_filters = [
+                getattr(self._pyrpl.rp, module).filter_select_ch1
+                for module in ('lockin', 'lockin1')]
         minphase_gain = 937716.0 / (2 ** 21)
         linear_gain = (802861.0 / (2 ** 21)) * (299.0 / 256.0)
-        gains = [linear_gain if name == '2kHz_linear' else minphase_gain
+        fast_linear_gain = 200955.0 / (2 ** 21)
+        wide_minphase_gain = 7326.0 / (2 ** 14)
+        gains = [fast_linear_gain if name == '20kHz_linear' else
+                 wide_minphase_gain if name in ('6kHz_minphase', '10kHz_minphase', '10kHz_minphase_2048') else
+                 linear_gain if name == '2kHz_linear' else minphase_gain
                  for name in self._configured_lock_in_filters]
         return {
             'stream_words_per_sample': int(self._stream_words_per_sample),
@@ -248,7 +319,33 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         if slope_lsb_per_hz <= 0:
             raise ValueError(f'Slope must be positive, got {slope_lsb_per_hz}')
 
-        if pi:
+        if self._tracking_algorithm == 'smith_linear':
+            if pi:
+                raise ValueError(
+                    'smith_linear currently implements the collaborator I+Smith model; '
+                    'set pi=False')
+            # Other shared Qudi hardware modules can select the FIR during scans or
+            # activation. Reassert the modeled path immediately before configuring
+            # the controller, then let the FPGA compatibility input verify it.
+            lock_in = self._pyrpl.rp.lockin
+            lock_in.fir_bypass_ch1 = False
+            lock_in.demod_bypass_ch1 = False
+            modeled_filter = lock_in.smith_filter_name
+            lock_in.filter_select_ch1 = modeled_filter
+            self.set_integrator_source('sw')
+            delay_samples = (None if self._smith_delay_samples is None else
+                             int(self._smith_delay_samples))
+            self._lock.set_bandwidth_smith(
+                bandwidth_hz, slope_lsb_per_hz,
+                gain_multiplier=float(self._smith_gain_multiplier),
+                delay_samples=delay_samples)
+            self._configured_lock_in_filters[0] = modeled_filter
+            self.log.info(
+                f'Lock configured (I+Smith): base BW={bandwidth_hz:.1f} Hz, '
+                f'gain=x{float(self._smith_gain_multiplier):.3g}, '
+                f'slope={slope_lsb_per_hz:.3e} LSB/Hz, '
+                f'delay={int(self._lock.smith_delay_samples)} samples')
+        elif pi:
             if not 0.1 <= zero_ratio <= 30.0:
                 raise ValueError(f'Zero ratio must be in [0.1, 30.0], got {zero_ratio}')
             self._lock.set_bandwidth_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)
@@ -262,6 +359,51 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 f'Lock configured (I-only): BW={bandwidth_hz:.1f} Hz, '
                 f'slope={slope_lsb_per_hz:.3e} LSB/Hz'
             )
+
+    def set_tracking_algorithm(self, algorithm: str,
+                               smith_gain_multiplier: Optional[float] = None,
+                               smith_delay_samples: Optional[int] = None) -> None:
+        """Select conventional or single-resonance linear-FIR Smith tracking.
+
+        The loop must be disabled for an algorithm change. Calling
+        :meth:`set_bandwidth` afterwards applies the selected controller gains and
+        predictor model. This method makes conservative x2/x4/x6/x8/x10 sweeps
+        possible from the Qudi namespace without restarting Qudi.
+        """
+        if self._lock is None:
+            raise RuntimeError('Red Pitaya ODMR lock is not active')
+        if self._lock.enable:
+            raise RuntimeError('disable the lock before changing tracking algorithm')
+        if algorithm not in ('conventional', 'smith_linear'):
+            raise ValueError('algorithm must be "conventional" or "smith_linear"')
+        if algorithm == 'smith_linear' and self._pyrpl.rp.lockin.smith_filter_name is None:
+            raise ValueError('This minimum-phase FPGA profile has no Smith-compatible filter')
+        if smith_gain_multiplier is not None:
+            value = float(smith_gain_multiplier)
+            if value <= 0:
+                raise ValueError('Smith gain multiplier must be positive')
+            self._smith_gain_multiplier = value
+        if smith_delay_samples is not None:
+            value = int(smith_delay_samples)
+            if not 1 <= value < 128:
+                raise ValueError('Smith delay must be in [1, 127] samples')
+            self._smith_delay_samples = value
+        self._tracking_algorithm = algorithm
+        self._lock.smith_enable = False
+        if algorithm == 'smith_linear':
+            lock_in = self._pyrpl.rp.lockin
+            modeled_filter = lock_in.smith_filter_name
+            lock_in.fir_bypass_ch1 = False
+            lock_in.demod_bypass_ch1 = False
+            lock_in.filter_select_ch1 = modeled_filter
+            self._configured_lock_in_filters[0] = modeled_filter
+        self._lock.clear()
+        delay_for_log = (self._smith_delay_samples if self._smith_delay_samples is not None
+                         else self._pyrpl.rp.lockin.linear_group_delay_samples)
+        self.log.info(
+            'Tracking algorithm selected: %s (Smith gain x%.3g, delay %d samples)',
+            algorithm, float(self._smith_gain_multiplier),
+            int(delay_for_log))
 
     def set_bandwidth_pi(self, bandwidth_hz: float, slope_lsb_per_hz: float,
                          zero_ratio: float = 3.0) -> None:
@@ -390,8 +532,23 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
     @property
     def stream_sample_rate(self) -> float:
-        """Aggregate demod stream rate [Hz] (125 MHz / 4096 ~= 30.5 kHz)."""
-        return float(self._STREAM_SAMPLE_RATE_HZ)
+        """Aggregate demod stream rate [Hz], reported by the FPGA image."""
+        return float(self._stream_sample_rate_hz)
+
+    @property
+    def fpga_clock_hz(self) -> int:
+        """FPGA DSP clock reported by the active firmware image."""
+        return int(self._fpga_clock_hz)
+
+    @property
+    def sample_period_cycles(self) -> int:
+        """Lock-in/tracker update interval in FPGA clock cycles."""
+        return int(self._sample_period_cycles)
+
+    @property
+    def ftw_per_hz(self) -> float:
+        """Generator frequency-tuning words per hertz for this image."""
+        return (2.0 ** 32) / self.fpga_clock_hz
 
     @property
     def stream_words_per_sample(self) -> int:
@@ -514,11 +671,14 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             return
 
         self._nslots = int(nslots)
+        if self._tracking_algorithm == 'smith_linear' and self._nslots != 1:
+            raise RuntimeError(
+                'smith_linear is validated only for single-resonance tracking; '
+                'select conventional control for multi-resonance hopping')
         # ensure the LO-hop trigger reaches the Windfreak (DIO7_P, inverted)
         if self._nslots > 1:
             self._configure_hop_trigger_pin()
         # reset the high-rate trace buffers
-        self._trace_values = np.array([], dtype=np.float64)
         self._trace_ticks = np.array([], dtype=np.int64)
         self._trace_steps = np.array([], dtype=np.int64)
         self._trace_sample_offset = 0
@@ -546,14 +706,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._tracking_active = True
 
         if stream_traces:
-            # MARKED-continuous self-describing push stream:
-            # a free-running /4096 tick streams [err, corr, state] EVERY demod period,
-            # where state = resonance index when live or a DEAD sentinel during the
-            # per-hop settle/freeze. So the dead-time is explicit and the PC timeline is
-            # uniform/exact -> per-resonance reconstruction has correct absolute timing
-            # (the legacy 'dual' mode dropped the dead-time and inflated the visit rate).
-            # Decode with scan.reconstruct_marked_series(). Requires the marked-stream
-            # bitstream (STREAM_CONTROL[5]); falls back to 'dual' if unavailable.
+            # Region-11 supplies independently timestamped FIR/CIC/correction and
+            # step/live-window events. Hopping and observation remain independent.
             self._start_trace_stream_hardware()
 
         if not self._single_slot_no_hop:
@@ -580,7 +734,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         try:
             with self._stream_lock:
                 if self._streaming_traces:
-                    self._scan.hop_stream_stop()
+                    self._streamer.unsubscribe(self._stream_reader)
+                    self._stream_reader = None
                     self._streaming_traces = False
                 if not self._single_slot_no_hop:
                     self._scan.stop()
@@ -593,22 +748,18 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
     def _start_trace_stream_hardware(self) -> None:
         """Start/reset only the push-stream side of the tracking engine."""
-        self._trace_values = np.array([], dtype=np.float64)
         self._trace_ticks = np.array([], dtype=np.int64)
         self._trace_steps = np.array([], dtype=np.int64)
         self._trace_sample_offset = 0
-        self._stream_source = 'marked'
-        try:
-            self._scan.hop_stream_start(input_source='marked')
-        except Exception as e:
-            self.log.warning(f"Marked-continuous stream unavailable ({e}); "
-                             f"falling back to legacy 'dual'.")
-            self._stream_source = 'dual'
-            self._scan.hop_stream_start(input_source='dual')
-        self._stream_words_per_sample = int(self._scan.stream_words_per_sample)
-        if self._stream_words_per_sample != 4:
-            self.log.warning('Tracking stream has %d words/sample; CIC trace will be NaN.',
-                             self._stream_words_per_sample)
+        self._pending_xmarkers = np.empty(0, dtype=np.int64)
+        self._pending_ymarkers = np.empty(0, dtype=np.int64)
+        self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
+        self._stream_reader = self._streamer.subscribe(
+            ('fir', 'cic', 'correction', 'step', 'x_position',
+             'y_position', 'window'), poll_us=50,
+            ring_bytes=32 << 20, coalesce_us=500)
+        self._stream_source = 'events'
+        self._stream_words_per_sample = 1
         self._streaming_traces = True
 
     def start_trace_stream(self) -> None:
@@ -634,7 +785,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 raise RuntimeError(
                     'Cannot stop the trace stream while a KDC_HW_SYNC_MULTIRES motor '
                     'scan owns its position-marker data.')
-            self._scan.hop_stream_stop()
+            self._streamer.unsubscribe(self._stream_reader)
+            self._stream_reader = None
             self._streaming_traces = False
             self._mapped_scan_active = False
         self.log.info('Multi-resonance trace stream stopped independently.')
@@ -642,10 +794,9 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def read_traces(self) -> Optional[Dict[str, Any]]:
         """Reconstructed per-resonance high-rate traces since session start (capped).
 
-        Decodes the self-describing stream ([err, corr, cic, state] records)
-        into synchronous per-resonance post-FIR error, correction, and pre-FIR CIC traces
-        at the full demod rate (~30.5 kHz aggregate, shared across resonances by the
-        hop schedule). Indefinite operation is covered by per-slot register polling
+        Aligns timestamped Region-11 events into synchronous per-resonance post-FIR
+        error, correction, and pre-FIR CIC traces at the FPGA-reported demodulation
+        rate. Indefinite operation is covered by per-slot register polling
         (:meth:`get_slot_status`); this high-rate buffer is a ROLLING window of the
         last ``max_trace_samples`` words (oldest dropped), so it stays bounded at
         constant resolution instead of growing/freezing.
@@ -658,50 +809,28 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         if not (self._tracking_active and self._streaming_traces):
             return None
 
-        # Pull new words; the FPGA-reported record width keeps all columns aligned.
-        # While a mapped 2D scan owns the drain, it feeds self._trace_values via
-        # read_stream_words(); draining here too would steal words from it, so skip
-        # the physical drain and just reconstruct the shared buffer's current state.
         if not self._mapped_scan_active and not self._field_drain_active:
             with self._stream_lock:
-                new_vals = self._scan.hop_stream_read()  # float64, NaN = transport loss
-            if new_vals is not None and len(new_vals):
-                self._trace_values = np.concatenate([self._trace_values,
-                                                     np.asarray(new_vals, dtype=np.float64)])
-                self._trim_trace_buffer()
-
-        width = int(self._stream_words_per_sample)
-        if self._trace_values.size < width:
+                new_events = self._stream_reader.read_events()
+            self._append_event_trace(new_events)
+        if self._trace_events is None or not self._trace_events.size:
             return None
-
-        if getattr(self, '_stream_source', 'dual') == 'marked':
-            # Marked-continuous: every demod period is a slot, dead-time explicit ->
-            # uniform/exact timeline. reconstruct returns fresh-while-live (NaN during
-            # dead or another resonance); ZOH-fill here so the GUI shows continuous
-            # per-resonance traces (the field estimate is held while parked).
-            rec = self._scan.reconstruct_marked_series(
-                self._trace_values, nslots=self._nslots, to_hz_corr=True,
-                words_per_sample=width)
-            err = self._ffill_marked_rows(rec['err'], rec['step'])
-            corr_hz = self._ffill_marked_rows(rec['corr'], rec['step'])
-            cic = self._ffill_marked_rows(rec['cic'], rec['step'])
-            dead = rec.get('dead')
+        rec = self._streamer.reconstruct_tracking(
+            self._trace_events, nslots=self._nslots,
+            interval=self._sample_period_cycles,
+            correction_converter=self._scan.ftw_to_hz)
+        err = self._ffill_marked_rows(rec['err'], rec['step'])
+        corr_hz = self._ffill_marked_rows(rec['corr'], rec['step'])
+        cic = self._ffill_marked_rows(rec['cic'], rec['step'])
+        if rec['ticks'].size:
+            times = ((rec['ticks'] - rec['ticks'][0]).astype(np.float64) /
+                     self._fpga_clock_hz + self._trace_sample_offset /
+                     self._stream_sample_rate_hz)
         else:
-            rec = self._scan.reconstruct_dual_hop_series(
-                self._trace_values, nslots=self._nslots, to_hz_corr=True,
-                words_per_sample=width)
-            err = rec['err']        # (N, T) raw LSB
-            corr_hz = rec['corr']   # (N, T) Hz
-            cic = rec['cic']        # (N, T) raw CIC LSB
-            dead = None
-        t_count = err.shape[1]
-        times = (self._trace_sample_offset + np.arange(t_count, dtype=np.float64)) \
-                / self._STREAM_SAMPLE_RATE_HZ
-        out = {'times': times, 'err': err, 'corr_hz': corr_hz, 'cic': cic,
-               'sample_rate': self._STREAM_SAMPLE_RATE_HZ}
-        if dead is not None:
-            out['dead'] = dead
-        return out
+            times = np.empty(0, dtype=np.float64)
+        return {'times': times, 'err': err, 'corr_hz': corr_hz,
+                'cic': cic, 'dead': rec['dead'],
+                'sample_rate': self._stream_sample_rate_hz}
 
     @staticmethod
     def _ffill_rows(a):
@@ -731,42 +860,46 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             out[r, live_loss] = np.nan
         return out
 
-    def _trim_trace_buffer(self) -> None:
-        """Roll the high-rate display buffer to the last ``_trace_window_words`` words.
-
-        Trims on a record boundary (word 0 = session start is aligned, so
-        dropping a multiple of the reported width keeps the columns
-        phase intact). Keeps the tracking GUI window bounded + constant-resolution
-        instead of growing unbounded and freezing at a cap.
-        """
-        window = int(self._trace_window_words)
-        width = int(self._stream_words_per_sample)
-        n_complete = self._trace_values.size // width
-        keep = window // width
-        if keep >= 1 and n_complete > keep:
-            dropped = n_complete - keep
-            start = dropped * width
-            self._trace_values = self._trace_values[start:]
-            self._trace_sample_offset += dropped
+    def _append_event_trace(self, events) -> None:
+        """Append decoded events and keep a bounded, timestamped rolling window."""
+        if events is not None and len(events):
+            events = np.asarray(events, dtype=self._streamer.EVENT_DTYPE)
+            self._trace_events = np.concatenate((self._trace_events, events))
+        if self._trace_events is None:
+            return
+        # A mapped motor scan consumes marker indices incrementally. Retain its
+        # complete event history until the scan ends so trimming cannot move the
+        # marker arrays underneath the per-axis ``seen`` cursors.
+        if self._mapped_scan_active:
+            return
+        # The old option counted words. Preserve approximately the same memory
+        # bound by interpreting it as a maximum number of event records here.
+        keep = max(1, int(self._trace_window_words))
+        if self._trace_events.size > keep:
+            dropped = self._trace_events.size - keep
+            dropped_fir = np.count_nonzero(
+                self._trace_events[:dropped]['source'] ==
+                self._streamer.SOURCE_IDS['fir'])
+            self._trace_sample_offset += int(dropped_fir)
+            self._trace_events = self._trace_events[dropped:]
 
     def set_trace_window_seconds(self, seconds: float) -> None:
         """Set the high-rate display window duration (rolling buffer length).
 
-        Live-settable from the tracking GUI. In the marked stream one fixed-width
-        at ~30.5 kHz, so the buffer holds ``seconds * rate`` samples; shrinking trims
-        immediately on the next read, growing fills over ``seconds``. Independent of
+        Live-settable from the tracking GUI. The event buffer is sized from the
+        FPGA-reported sample rate; shrinking trims immediately on the next read.
+        Independent of
         the per-slot register-poll drift history (that has its own length).
         """
         s = float(seconds)
         if not np.isfinite(s) or s <= 0:
             self.log.warning('set_trace_window_seconds: ignoring non-positive value %r', seconds)
             return
-        width = int(self._stream_words_per_sample)
-        self._trace_window_words = max(width,
-                                       int(round(s * self._STREAM_SAMPLE_RATE_HZ)) * width)
+        self._trace_window_words = max(1, int(round(s * self._stream_sample_rate_hz)))
         # Trim right away if the new window is shorter than the current buffer.
-        self._trim_trace_buffer()
-        self.log.debug('High-rate trace window set to %.2f s (%d words).',
+        if self._trace_events is not None and self._trace_events.size:
+            self._append_event_trace(np.empty(0, dtype=self._streamer.EVENT_DTYPE))
+        self.log.debug('High-rate trace window set to %.2f s (%d events).',
                        s, self._trace_window_words)
 
     # =========================================================================
@@ -775,12 +908,10 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def enable_position_markers(self, enable: bool) -> None:
         """Enable/disable KDC x/y position-marker capture on the running stream.
 
-        Both directions RESTART the push stream (via ``hop_stream_start`` with/without
-        ``xy_markers``), which resets the demod ring + sample counter so demod word 0
-        aligns with the marker origin -- the alignment a 2D scan needs to bin the
-        reconstructed traces by absolute marker index. The continuous-hop FSM and the
-        per-slot lock integrators are separate from the stream engine, so this does
-        NOT perturb the lock (only the high-rate display buffer restarts).
+        Position events are always available Region-11 sources. Restarting this
+        subscriber establishes a fresh local marker origin without resetting the
+        shared packetizer or disturbing other subscribers and does not perturb the
+        controller or hop sequencer.
         """
         if self._scan is None:
             self.log.warning('enable_position_markers: rp.scan unavailable.')
@@ -791,11 +922,6 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                     'KDC_HW_SYNC_MULTIRES needs an active multi-resonance trace stream. '
                     'Configure tracking and click Start Stream first; Start Tracking is '
                     'optional (open-loop error mapping is supported).')
-            if enable and getattr(self, '_stream_source', 'marked') != 'marked':
-                self.log.warning(
-                    "Position-marker 2D scan needs the MARKED stream for fresh-only "
-                    "per-resonance binning; current source is %r. Per-bin means may "
-                    "include held (parked) values.", self._stream_source)
             if enable:
                 # Stop the tracking poll's drain FIRST (so it can't read the
                 # StreamClient we are about to replace), then restart with markers.
@@ -808,96 +934,64 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                       'ENABLED (2D mapped scan)' if enable else 'disabled')
 
     def _restart_mapped_stream(self, xy_markers: bool) -> None:
-        """Restart the tracker's push stream with/without x/y marker capture.
-
-        Uses ``hop_stream_start`` (which pulses a stream reset and starts a fresh
-        receiver) so the new session starts at demod word 0. The hop FSM keeps
-        looping (it is not restarted here). Also clears the display-trace buffer so
-        :meth:`read_traces` re-aligns to the new word 0.
-        """
-        src = getattr(self, '_stream_source', 'marked')
-        # Stop our own running stream cleanly first, so the (intentional) restart does
-        # not trip pyrpl's "a push stream is already running" takeover warning -- that
-        # warning should fire only for a genuine second, competing stream owner.
-        try:
-            self._scan.hop_stream_stop()
-        except Exception:
-            pass
-        try:
-            self._scan.hop_stream_start(input_source=src, xy_markers=bool(xy_markers))
-        except TypeError:
-            # older pyrpl without the xy_markers kwarg
-            if xy_markers:
-                self.log.error('pyrpl scan.hop_stream_start lacks xy_markers=; update '
-                               'pyrpl to the 2D multi-resonance build.')
-            self._scan.hop_stream_start(input_source=src)
-        # fresh alignment for the display buffer
-        # Preserve elapsed time across this intentional stream restart.  The exact
-        # restart latency is not represented by FPGA samples, but the saved/visible
-        # time axis never jumps backwards to zero.
-        self._trace_sample_offset += self._trace_values.size // int(self._stream_words_per_sample)
-        self._trace_values = np.array([], dtype=np.float64)
+        """Replace this subscriber to establish a fresh local marker origin."""
+        elapsed = 0
+        if self._trace_events is not None:
+            elapsed = int(np.count_nonzero(
+                self._trace_events['source'] == self._streamer.SOURCE_IDS['fir']))
+        self._streamer.unsubscribe(self._stream_reader)
+        self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
+        self._stream_reader = self._streamer.subscribe(
+            ('fir', 'cic', 'correction', 'step', 'x_position',
+             'y_position', 'window'), poll_us=50,
+            ring_bytes=32 << 20, coalesce_us=500)
+        self._trace_sample_offset += elapsed
+        self._pending_xmarkers = np.empty(0, dtype=np.int64)
+        self._pending_ymarkers = np.empty(0, dtype=np.int64)
+        self._marker_x_seen = 0
+        self._marker_y_seen = 0
 
     def read_position_markers(self) -> Tuple[np.ndarray, np.ndarray]:
         """New (x, y) position markers since the last call, as sample indices."""
         empty = (np.array([], dtype=np.int64), np.array([], dtype=np.int64))
-        if self._scan is None or not self._streaming_traces:
+        if not self._streaming_traces:
             return empty
-        try:
-            xm = np.asarray(self._scan.read_x_markers(), dtype=np.int64)
-            ym = np.asarray(self._scan.read_y_markers(), dtype=np.int64)
-        except Exception as e:
-            self.log.warning('read_position_markers failed: %s', e)
-            return empty
-        # In the self-describing marked/dual stream the marker values are WORD
-        # indices; convert with the FPGA-reported width to time-sample indices so
-        # they index the reconstructed per-resonance traces directly.
-        if getattr(self, '_stream_source', 'marked') in ('marked', 'dual'):
-            xm = self._scan.markers_to_sample_index(
-                xm, words_per_sample=self._stream_words_per_sample)
-            ym = self._scan.markers_to_sample_index(
-                ym, words_per_sample=self._stream_words_per_sample)
-        return xm, ym
+        result = (self._pending_xmarkers, self._pending_ymarkers)
+        self._pending_xmarkers = np.empty(0, dtype=np.int64)
+        self._pending_ymarkers = np.empty(0, dtype=np.int64)
+        return result
 
     def read_stream_words(self) -> np.ndarray:
         """New raw self-describing stream words (destructive drain)."""
-        if self._scan is None or not self._streaming_traces:
-            return np.array([], dtype=np.float64)
+        if not self._streaming_traces:
+            return np.empty(0, dtype=self._streamer.EVENT_DTYPE)
         try:
             with self._stream_lock:
-                w = self._scan.hop_stream_read()
+                events = self._stream_reader.read_events()
         except Exception as e:
-            self.log.warning('read_stream_words failed: %s', e)
-            return np.array([], dtype=np.float64)
-        w = np.asarray(w, dtype=np.float64) if w is not None else np.array([], dtype=np.float64)
-        # Keep the tracking-display buffer (read_traces) fed with recent data while
-        # the motor scan owns the physical drain, so the tracking GUI's high-rate
-        # plots still update -- rolling window, same as read_traces.
-        if w.size:
-            self._trace_values = np.concatenate([self._trace_values, w])
-            self._trim_trace_buffer()
-        return w
+            self.log.warning('read_stream_words event drain failed: %s', e)
+            return np.empty(0, dtype=self._streamer.EVENT_DTYPE)
+        self._append_event_trace(events)
+        if self._trace_events.size:
+            rec = self._streamer.reconstruct_tracking(
+                self._trace_events, nslots=self._nslots,
+                interval=self._sample_period_cycles)
+            self._pending_xmarkers = rec['x_position'][self._marker_x_seen:]
+            self._pending_ymarkers = rec['y_position'][self._marker_y_seen:]
+            self._marker_x_seen = rec['x_position'].size
+            self._marker_y_seen = rec['y_position'].size
+        return events
 
     def reconstruct_mapped_traces(self, words) -> Dict[str, Any]:
         """Decode accumulated record words -> fresh-only err/corr/CIC traces."""
-        words = np.asarray(words, dtype=np.float64)
-        rate = self._STREAM_SAMPLE_RATE_HZ
-        if getattr(self, '_stream_source', 'marked') == 'marked':
-            # Marked-continuous: fresh-only (NaN when parked/dead/loss). Exactly what
-            # per-bin nanmean needs -- no zero-order hold leaking parked values.
-            rec = self._scan.reconstruct_marked_series(
-                words, nslots=self._nslots, to_hz_corr=True,
-                words_per_sample=self._stream_words_per_sample)
-        else:
-            # Dual fallback: this ZOH-fills parked regions, so per-bin means may
-            # include held values (warned in enable_position_markers).
-            rec = self._scan.reconstruct_dual_hop_series(
-                words, nslots=self._nslots, to_hz_corr=True,
-                words_per_sample=self._stream_words_per_sample)
-        err = np.asarray(rec['err'], dtype=np.float64)
-        corr = np.asarray(rec['corr'], dtype=np.float64)
-        cic = np.asarray(rec['cic'], dtype=np.float64)
-        t_count = err.shape[1] if err.ndim == 2 else 0
-        times = np.arange(t_count, dtype=np.float64) / rate
-        return {'err': err, 'corr_hz': corr, 'cic': cic,
-                'times': times, 'sample_rate': rate}
+        events = np.asarray(words, dtype=self._streamer.EVENT_DTYPE)
+        rec = self._streamer.reconstruct_tracking(
+            events, nslots=self._nslots,
+            interval=self._sample_period_cycles,
+            correction_converter=self._scan.ftw_to_hz)
+        times = ((rec['ticks'] - rec['ticks'][0]).astype(np.float64) /
+                 self._fpga_clock_hz
+                 if rec['ticks'].size else np.empty(0, dtype=np.float64))
+        return {'err': rec['err'], 'corr_hz': rec['corr'], 'cic': rec['cic'],
+                'times': times, 'dead': rec['dead'],
+                'sample_rate': self._stream_sample_rate_hz}

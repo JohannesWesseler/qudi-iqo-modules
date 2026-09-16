@@ -12,6 +12,7 @@ _pyrpl_instances = {}
 from threading import Lock
 import logging
 import sys
+import os
 
 _pyrpl_lock = Lock()
 
@@ -72,7 +73,7 @@ def patch_pyrpl_logging():
         print(f"Failed to patch pyrpl logging: {e}")
 
 
-def get_pyrpl_instance(hostname, config_name, gui=True):
+def get_pyrpl_instance(hostname, config_name, gui=True, fpga_filename=None):
     """
     Factory function to get or create a shared pyrpl.Pyrpl instance.
     This ensures that only one connection per Red Pitaya is established.
@@ -93,12 +94,27 @@ def get_pyrpl_instance(hostname, config_name, gui=True):
             gui = False
     with _pyrpl_lock:
         instance_key = f"{hostname}_{config_name}"
+        requested_filename = (os.path.abspath(os.path.expanduser(fpga_filename))
+                              if fpga_filename else None)
+        if requested_filename and not os.path.isfile(requested_filename):
+            raise FileNotFoundError(
+                f'Configured Red Pitaya FPGA image does not exist: {requested_filename}')
 
         if instance_key in _pyrpl_instances:
             # Return existing instance
-            pyrpl_object, owner_count = _pyrpl_instances[instance_key]
+            pyrpl_object, owner_count, active_filename = _pyrpl_instances[instance_key]
+            normalized_requested = (os.path.normcase(requested_filename)
+                                    if requested_filename else None)
+            normalized_active = (os.path.normcase(active_filename)
+                                 if active_filename else None)
+            if normalized_requested != normalized_active:
+                raise RuntimeError(
+                    'Shared Red Pitaya instance already uses FPGA image '
+                    f'{active_filename!r}, requested {requested_filename!r}. '
+                    'All modules sharing one config_name must specify the same image.')
             owner_count += 1
-            _pyrpl_instances[instance_key] = (pyrpl_object, owner_count)
+            _pyrpl_instances[instance_key] = (
+                pyrpl_object, owner_count, active_filename)
             is_owner = False
             return pyrpl_object, is_owner
         else:
@@ -123,6 +139,7 @@ def get_pyrpl_instance(hostname, config_name, gui=True):
                     config="",  # We don't load a config currently
                     reload_fpga=True,
                     reload_server=True,
+                    filename=requested_filename,
                     gui=gui  # Keep GUI enabled
                 )
 
@@ -131,7 +148,8 @@ def get_pyrpl_instance(hostname, config_name, gui=True):
                     pyrpl_object.logger.setLevel(logging.WARNING)
 
             # Store the instance and a reference count (starting at 1)
-            _pyrpl_instances[instance_key] = (pyrpl_object, 1)
+            _pyrpl_instances[instance_key] = (
+                pyrpl_object, 1, requested_filename)
             is_owner = True
             return pyrpl_object, is_owner
 
@@ -144,7 +162,7 @@ def release_pyrpl_instance(hostname, config_name):
     with _pyrpl_lock:
         instance_key = f"{hostname}_{config_name}"
         if instance_key in _pyrpl_instances:
-            pyrpl_object, owner_count = _pyrpl_instances[instance_key]
+            pyrpl_object, owner_count, active_filename = _pyrpl_instances[instance_key]
             owner_count -= 1
 
             if owner_count <= 0:
@@ -163,4 +181,5 @@ def release_pyrpl_instance(hostname, config_name):
                 del pyrpl_object
             else:
                 # Update the count
-                _pyrpl_instances[instance_key] = (pyrpl_object, owner_count)
+                _pyrpl_instances[instance_key] = (
+                    pyrpl_object, owner_count, active_filename)

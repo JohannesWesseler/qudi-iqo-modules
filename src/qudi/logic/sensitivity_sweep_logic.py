@@ -60,6 +60,11 @@ from my_software.sensitivity_msmt.auswertung.sensitivity_auswertung_modular impo
 
 # Import visualization module for summary plots
 from qudi.logic.sensitivity_sweep_visualizer import SensitivitySweepVisualizer
+from qudi.logic.tracking_sensitivity_tools import (
+    build_tracking_conditions,
+    json_safe,
+    reconstruct_field_traces,
+)
 
 
 class SensitivitySweepLogic(LogicBase):
@@ -99,6 +104,8 @@ class SensitivitySweepLogic(LogicBase):
 
     _odmr_logic = Connector(name='odmr_logic', interface='OdmrLogic')
     _time_series_logic = Connector(name='time_series_logic', interface='TimeSeriesReaderLogic')
+    _odmr_lock_hw = Connector(
+        name='odmr_lock_hw', interface='OdmrFreqLockInterface', optional=True)
 
     # =========================================================================
     # Config Options
@@ -328,6 +335,31 @@ class SensitivitySweepLogic(LogicBase):
                 if not isinstance(sweep_params[key], (np.ndarray, list)):
                     raise ValueError(f'Sweep parameter {key} must be array-like')
 
+            profiles = stream_params.get('filter_sweep', [])
+            if stream_params.get('fir_filter_bandwidth') == '10kHz_minphase_2048':
+                capabilities = self._time_series_logic()._streamer()._pyrpl.rp.lockin.filter_capabilities
+                if not capabilities.get('10kHz_minphase_2048'):
+                    raise ValueError('The selected 10 kHz filter requires the /2048 N=3 M=1 FPGA image')
+                if any(mode in ('smith_linear', 'closed_loop_smith')
+                       for mode in stream_params.get('tracking_modes', [])):
+                    raise ValueError('The /2048 minimum-phase profile does not support Smith compensation')
+                stream_params = dict(stream_params, f_enbw=10640.924904046242)
+            if profiles:
+                if any(mode in ('smith_linear', 'closed_loop_smith')
+                       for mode in stream_params.get('tracking_modes', [])):
+                    raise ValueError('Minimum-phase filter comparison requires Smith disabled')
+                capabilities = self._time_series_logic()._streamer()._pyrpl.rp.lockin.filter_capabilities
+                for profile in profiles:
+                    name = profile['fir_filter_bandwidth']
+                    if name not in ('6kHz_minphase', '10kHz_minphase') or not capabilities.get(name):
+                        raise ValueError(f'Comparison filter {name} is unavailable on this FPGA')
+                    bandwidths = np.asarray(profile['controller_bandwidths_hz'], dtype=float)
+                    if bandwidths.ndim != 1 or not bandwidths.size or not np.all(
+                            np.isfinite(bandwidths) & (bandwidths > 0)):
+                        raise ValueError(f'Invalid controller bandwidths for {name}')
+                    if not np.isfinite(profile['f_enbw']) or profile['f_enbw'] <= 0:
+                        raise ValueError(f'Invalid ENBW for {name}')
+
             # Store configuration
             self._sweep_parameters = {
                 'power': np.array(sweep_params['power']),
@@ -538,20 +570,36 @@ class SensitivitySweepLogic(LogicBase):
 
                 # Perform measurement
                 try:
-                    result = self._measure_single_point(idx, param_values)
-                    self._results_list.append(result)
+                    point_results = self._measure_single_point(idx, param_values)
+                    if isinstance(point_results, dict):
+                        point_results = [point_results]
+                    for result in point_results:
+                        self._results_list.append(result)
 
-                    # Update best result
-                    if not np.isnan(result.get('sensitivity_nT_rtHz', np.nan)):
-                        if result['sensitivity_nT_rtHz'] < self._best_sensitivity:
-                            self._best_sensitivity = result['sensitivity_nT_rtHz']
-                            self._best_parameters = param_values.copy()
-                            self.log.info(
-                                f'New best sensitivity: {self._best_sensitivity:.3f} nT/sqrtHz'
-                            )
+                        # Update best result across all open/closed-loop conditions.
+                        if not np.isnan(result.get('sensitivity_nT_rtHz', np.nan)):
+                            if result['sensitivity_nT_rtHz'] < self._best_sensitivity:
+                                self._best_sensitivity = result['sensitivity_nT_rtHz']
+                                self._best_parameters = param_values.copy()
+                                self._best_parameters.update({
+                                    'fir_filter_bandwidth': result.get('fir_filter_bandwidth'),
+                                    'measurement_mode': result.get('measurement_mode', 'open_loop'),
+                                    'controller_algorithm': result.get(
+                                        'controller_algorithm', 'disabled'),
+                                    'controller_bandwidth_hz': result.get(
+                                        'controller_bandwidth_hz'),
+                                    'smith_gain_multiplier': result.get(
+                                        'smith_gain_multiplier'),
+                                    'smith_delay_samples': result.get(
+                                        'smith_delay_samples'),
+                                })
+                                self.log.info(
+                                    f'New best sensitivity: {self._best_sensitivity:.3f} nT/sqrtHz'
+                                )
 
-                    # Emit point completed signal
-                    self.sigPointCompleted.emit(idx, result)
+                        # One table row per controller condition, all sharing the
+                        # same point index and associated hyperfine scan.
+                        self.sigPointCompleted.emit(idx, result)
 
                 except InterruptedError:
                     # Sweep was interrupted by pause/cancel - don't treat as error
@@ -598,7 +646,7 @@ class SensitivitySweepLogic(LogicBase):
             if self.module_state() == 'locked':
                 self.module_state.unlock()
 
-    def _measure_single_point(self, idx: int, params: Dict[str, float]) -> Dict[str, Any]:
+    def _measure_single_point(self, idx: int, params: Dict[str, float]) -> List[Dict[str, Any]]:
         """
         Perform a single sensitivity measurement for given parameters.
 
@@ -607,7 +655,8 @@ class SensitivitySweepLogic(LogicBase):
             params: Parameter dictionary with 'power', 'f_mod', 'f_dev'
 
         Returns:
-            Dictionary with measurement results
+            One result dictionary per filter/controller condition. Controller
+            conditions share a scan and fit only within the same filter.
         """
         power_dbm = params['power']
         f_mod_hz = params['f_mod']
@@ -620,6 +669,9 @@ class SensitivitySweepLogic(LogicBase):
             f'f_dev: {f_dev_khz:.1f} kHz'
         )
 
+        # Apply the point's FM and scan settings before thermal stabilization.
+        self._configure_mw_source(power_dbm, f_mod_hz, f_dev_khz)
+
         # Check if power changed (thermal stabilization needed)
         if idx > 0:
             prev_combination = self._parameter_combinations[idx - 1]
@@ -629,26 +681,72 @@ class SensitivitySweepLogic(LogicBase):
                     f'Power changed ({prev_params["power"]:.2f} -> {power_dbm:.2f} dBm). '
                     f'Waiting {self._thermal_stabilization_time}s for thermal stabilization...'
                 )
-                # Use interruptible sleep to allow pause/cancel during thermal wait
-                if not self._sleep_interruptible(self._thermal_stabilization_time):
-                    self.log.info('Thermal stabilization interrupted by pause/cancel request')
-                    raise InterruptedError('Sweep interrupted during thermal stabilization')
+                # Scan power is only a stored setting until output is enabled.
+                # Heat at the new power near the scan centre before acquisition.
+                settling_frequency = 0.5 * (
+                    self._odmr_parameters['frequency_start'] +
+                    self._odmr_parameters['frequency_stop'])
+                try:
+                    self._set_cw_frequency(settling_frequency, power_dbm)
+                    if not self._sleep_interruptible(self._thermal_stabilization_time):
+                        self.log.info('Thermal stabilization interrupted by pause/cancel request')
+                        raise InterruptedError('Sweep interrupted during thermal stabilization')
+                finally:
+                    self._odmr_logic().toggle_cw_output(False)
+
+        profiles = self._stream_parameters.get('filter_sweep')
+        if not profiles:
+            return self._measure_filter_point(idx, params)
+        original_parameters = self._stream_parameters
+        results = []
+        try:
+            for profile in profiles:
+                if self._pause_requested or self._cancel_requested:
+                    raise InterruptedError('Filter comparison interrupted')
+                self._stream_parameters = dict(original_parameters, **profile)
+                self._stream_parameters['fir_bypass'] = False
+                try:
+                    results.extend(self._measure_filter_point(idx, params))
+                except InterruptedError:
+                    raise
+                except Exception as error:
+                    self.log.exception('Filter measurement failed: %s', profile['fir_filter_bandwidth'])
+                    results.append({
+                        'power_dbm': power_dbm, 'f_mod_hz': f_mod_hz,
+                        'f_dev_khz': f_dev_khz,
+                        'fir_filter_bandwidth': profile['fir_filter_bandwidth'],
+                        'sensitivity_nT_rtHz': np.nan, 'error': str(error)})
+                finally:
+                    self._disable_tracking_safely()
+                    self._odmr_logic().toggle_cw_output(False)
+        finally:
+            self._stream_parameters = original_parameters
+        return results
+
+    def _measure_filter_point(self, idx, params):
+        """Acquire a fresh scan and slope for one filter, then its conditions."""
+        power_dbm, f_mod_hz, f_dev_khz = (
+            params['power'], params['f_mod'], params['f_dev'])
+        # Configure before naming/saving so labels describe the actual filter.
+        requested_filter = self._stream_parameters.get('fir_filter_bandwidth')
+        self._configure_lock_in_filters()
+        filter_name = self._stream_parameters.get('fir_filter_bandwidth', 'unknown')
+        if self._stream_parameters.get('filter_sweep') and (
+                filter_name != requested_filter or self._stream_parameters.get('fir_bypass')):
+            raise RuntimeError('Requested comparison filter was not applied')
 
         # Create filename nametag for this measurement (just the tag, not full path)
         # Use 'n' prefix for negative power values to avoid '-' in filenames
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         power_str = f'n{abs(power_dbm):.2f}' if power_dbm < 0 else f'{power_dbm:.2f}'
-        nametag = f'P_{power_str}dBm_fmod_{f_mod_hz / 1e3:.1f}k_fdev_{f_dev_khz:.1f}k_{timestamp}'
+        nametag = f'P_{power_str}dBm_fmod_{f_mod_hz / 1e3:.1f}k_fdev_{f_dev_khz:.1f}k_{filter_name}_{timestamp}'
 
-        # Full path prefix for our own data saving (fitting, ASD, etc.)
-        filename_prefix = os.path.join(self._current_folder, nametag)
-
-        # Configure lock-in filters ONCE before any measurements
-        # This ensures both ODMR scan and time series use the same filter settings
-        self._configure_lock_in_filters()
-
-        # Step 1: Configure microwave source
-        self._configure_mw_source(power_dbm, f_mod_hz, f_dev_khz)
+        # Keep every stream, parameter snapshot and the associated hyperfine scan
+        # in one point directory.  The independent Qudi ODMR save remains in its
+        # normal data directory for compatibility with the ODMR GUI.
+        point_folder = os.path.join(self._current_folder, nametag)
+        os.makedirs(point_folder, exist_ok=True)
+        filename_prefix = os.path.join(point_folder, nametag)
 
         # Step 2: Run ODMR scan
         frequencies, odmr_signal = self._run_odmr_scan(nametag)
@@ -661,13 +759,14 @@ class SensitivitySweepLogic(LogicBase):
 
         if fit_result is None:
             self.log.warning('Fit failed - skipping point')
-            return {
+            return [{
+                'fir_filter_bandwidth': filter_name,
                 'power_dbm': power_dbm,
                 'f_mod_hz': f_mod_hz,
                 'f_dev_khz': f_dev_khz,
                 'sensitivity_nT_rtHz': np.nan,
                 'sensitivity_rms_nT_rtHz': np.nan
-            }
+            }]
 
         # Emit fit data for GUI (add fit curve data for plotting)
         # Note: fit_hyperfine doesn't return fit_frequency and fit_data arrays
@@ -682,63 +781,119 @@ class SensitivitySweepLogic(LogicBase):
         # Center = mean(mean(peak_positions), mean(dip_positions))
         odmr_center_hz = self._calculate_odmr_center(fit_result)
 
+        # Store a local, lossless copy next to the traces.  This is the exact
+        # normalized scan that produced the slope used below, not merely a link
+        # to the latest scan in another Qudi directory.
+        hyperfine_path = os.path.join(point_folder, 'associated_hyperfine_scan.npz')
+        np.savez_compressed(
+            hyperfine_path,
+            frequency_hz=np.asarray(frequencies, dtype=np.float64),
+            demod_signal=np.asarray(odmr_signal, dtype=np.float64),
+            selected_zero_crossing_index=int(self._which_zero_crossing))
+        with open(os.path.join(point_folder, 'associated_hyperfine_fit.json'), 'w') as handle:
+            json.dump(json_safe(fit_result), handle, indent=2, allow_nan=False)
+
         # Step 4: Set CW to zero crossing
         zc_freq = fit_result['zero_crossing_frequencies [Hz]'][self._which_zero_crossing]
         slope = fit_result['zero_crossing_slopes [V/Hz]'][self._which_zero_crossing]
         self._set_cw_frequency(zc_freq, power_dbm)
 
-        # Step 5: Record time series and calculate sensitivity
-        sensitivity_on, sensitivity_on_rms, asd_freq, asd_on = self._measure_sensitivity(
-            filename_prefix + '_ON-resonant',
-            slope
-        )
-
-        # Emit ASD data for GUI (including sensitivity value for noise floor line)
-        self.sigASDDataReady.emit(asd_freq, asd_on, sensitivity_on)
-
-        # Optional: Off-resonant measurement
-        # Check stream_params for runtime override, otherwise use ConfigOption
-        include_off_resonant = self._stream_parameters.get(
-            'include_off_resonant', self._include_off_resonant_measurement
-        )
-        off_resonant_offset = self._stream_parameters.get(
-            'off_resonant_offset_hz', self._off_resonant_offset_hz
-        )
-
-        sensitivity_off = np.nan
-        sensitivity_off_rms = np.nan
-        if include_off_resonant:
-            off_freq = zc_freq + off_resonant_offset
-            self._set_cw_frequency(off_freq, power_dbm)
-            self.log.info(f'Measuring off-resonant sensitivity at {off_freq/1e9:.6f} GHz '
-                         f'(+{off_resonant_offset/1e6:.1f} MHz from zero-crossing)')
-            sensitivity_off, sensitivity_off_rms, _, _ = self._measure_sensitivity(
-                filename_prefix + '_OFF-resonant',
-                slope
-            )
-
-        # Turn off CW
-        self._odmr_logic().toggle_cw_output(False)
-
-        # Compile results
-        result = {
+        raw_slope, finite_sampler_scale = self._raw_discriminator_slope(slope)
+        common_result = {
+            'fir_filter_bandwidth': filter_name,
             'power_dbm': power_dbm,
             'f_mod_hz': f_mod_hz,
             'f_dev_khz': f_dev_khz,
             'odmr_center_hz': odmr_center_hz,
+            'zero_crossing_hz': float(zc_freq),
             'linewidth_hz': fit_result['linewidths [Hz]'][self._which_zero_crossing],
-            'zc_slope_V_per_Hz': slope,
-            'sensitivity_nT_rtHz': sensitivity_on,
-            'sensitivity_rms_nT_rtHz': sensitivity_on_rms,
-            'sensitivity_off_resonant_nT_rtHz': sensitivity_off,
-            'sensitivity_off_resonant_rms_nT_rtHz': sensitivity_off_rms
+            'zc_slope_V_per_Hz': float(slope),
+            'controller_slope_raw_lsb_per_hz': float(raw_slope),
+            'finite_sampler_scale': float(finite_sampler_scale),
+            'associated_hyperfine_scan': os.path.relpath(
+                hyperfine_path, self._current_folder),
         }
+        point_manifest = {
+            'schema_version': 1,
+            'created': datetime.now().isoformat(),
+            'microwave_parameters': {
+                'power_dbm': power_dbm,
+                'fm_modulation_frequency_hz': f_mod_hz,
+                'fm_deviation_khz': f_dev_khz,
+            },
+            'odmr_parameters': self._odmr_parameters,
+            'stream_parameters': self._stream_parameters,
+            'fit_summary': common_result,
+            'fit_result_file': 'associated_hyperfine_fit.json',
+            'scan_file': 'associated_hyperfine_scan.npz',
+        }
+        with open(os.path.join(point_folder, 'measurement_point.json'), 'w') as handle:
+            json.dump(json_safe(point_manifest), handle, indent=2, allow_nan=False)
 
-        self.log.info(
-            f'Measurement complete: Sensitivity = {sensitivity_on:.3f} nT/sqrtHz'
-        )
+        comparison_enabled = bool(
+            self._stream_parameters.get('tracking_comparison_enabled', False))
+        results = []
+        try:
+            if comparison_enabled:
+                conditions = build_tracking_conditions(
+                    self._stream_parameters.get('tracking_modes', ['open_loop']),
+                    self._stream_parameters.get('controller_bandwidths_hz', [300.0]),
+                    self._stream_parameters.get('smith_gain_multipliers', [4.0]),
+                    self._stream_parameters.get('smith_delay_samples', [None]))
+                if self._stream_parameters.get(
+                        'include_off_resonant', self._include_off_resonant_measurement):
+                    conditions.append({
+                        'measurement_mode': 'off_resonant_reference',
+                        'controller_algorithm': 'disabled',
+                        'controller_bandwidth_hz': None,
+                        'smith_gain_multiplier': None,
+                        'smith_delay_samples': None,
+                    })
+                self.log.info('Measuring %d tracking conditions from one hyperfine scan.',
+                              len(conditions))
+                for condition_index, condition in enumerate(conditions):
+                    if self._pause_requested or self._cancel_requested:
+                        raise InterruptedError('comparison interrupted')
+                    condition = dict(condition)
+                    condition['microwave_frequency_hz'] = float(zc_freq)
+                    if condition['measurement_mode'] == 'off_resonant_reference':
+                        off_resonant_offset = float(self._stream_parameters.get(
+                            'off_resonant_offset_hz', self._off_resonant_offset_hz))
+                        condition['microwave_frequency_hz'] += off_resonant_offset
+                        self._set_cw_frequency(
+                            condition['microwave_frequency_hz'], power_dbm)
+                    condition_result, asd_frequency, asd_data = \
+                        self._measure_tracking_condition(
+                            point_folder=point_folder,
+                            condition_index=condition_index,
+                            condition=condition,
+                            signed_slope=float(raw_slope))
+                    condition_result.update(common_result)
+                    results.append(condition_result)
+                    self.sigASDDataReady.emit(
+                        asd_frequency, asd_data,
+                        condition_result['sensitivity_nT_rtHz'])
+            else:
+                # Preserve the established open-loop workflow for old configs.
+                sensitivity_on, sensitivity_on_rms, asd_freq, asd_on = \
+                    self._measure_sensitivity(filename_prefix + '_ON-resonant', slope)
+                self.sigASDDataReady.emit(asd_freq, asd_on, sensitivity_on)
+                result = dict(common_result)
+                result.update({
+                    'measurement_mode': 'open_loop',
+                    'controller_algorithm': 'disabled',
+                    'controller_bandwidth_hz': None,
+                    'smith_gain_multiplier': None,
+                    'smith_delay_samples': None,
+                    'sensitivity_nT_rtHz': sensitivity_on,
+                    'sensitivity_rms_nT_rtHz': sensitivity_on_rms,
+                })
+                results.append(result)
+        finally:
+            self._disable_tracking_safely()
+            self._odmr_logic().toggle_cw_output(False)
 
-        return result
+        return results
 
     def _configure_mw_source(self, power_dbm: float, f_mod_hz: float, f_dev_khz: float):
         """Configure microwave source via ODMR logic."""
@@ -925,6 +1080,8 @@ class SensitivitySweepLogic(LogicBase):
         """
         fir_bypass = self._stream_parameters.get('fir_bypass', False)
         fir_filter_bw = self._stream_parameters.get('fir_filter_bandwidth', '2kHz_minphase')
+        smith_requested = (
+            'smith_linear' in self._stream_parameters.get('tracking_modes', []))
 
         self.log.info(f'Configuring lock-in filters: bypass={fir_bypass}, bandwidth={fir_filter_bw}')
 
@@ -950,6 +1107,8 @@ class SensitivitySweepLogic(LogicBase):
 
             # Access pyrpl instance from streamer
             if not hasattr(streamer, '_pyrpl') or streamer._pyrpl is None:
+                if self._stream_parameters.get('filter_sweep'):
+                    raise RuntimeError('Cannot apply comparison filter: PyRPL unavailable')
                 self.log.warning('Cannot access pyrpl instance from streamer - lock-in filters not configured')
                 return
 
@@ -957,10 +1116,30 @@ class SensitivitySweepLogic(LogicBase):
 
             # Access lockin module (named 'lockin' not 'lock_in' per PyRPL naming convention)
             if not hasattr(pyrpl_instance.rp, 'lockin'):
+                if self._stream_parameters.get('filter_sweep'):
+                    raise RuntimeError('Cannot apply comparison filter: lock-in unavailable')
                 self.log.warning('lockin module not available in pyrpl - filters not configured')
                 return
 
             lock_in = pyrpl_instance.rp.lockin
+
+            # The implemented Smith model explicitly represents the compiled
+            # linear-phase FIR delay.  A bypassed or minimum-phase lane is a
+            # different plant and would make a Smith/non-Smith comparison
+            # misleading.  This also protects against a GUI StatusVar retaining
+            # the 20 kHz selection when switching back to the /4096 image.
+            if smith_requested:
+                smith_filter = lock_in.smith_filter_name
+                if fir_bypass:
+                    self.log.warning(
+                        'FIR bypass is incompatible with the Smith comparison; '
+                        f'enabling the advertised Smith filter "{smith_filter}"')
+                    fir_bypass = False
+                if fir_filter_bw != smith_filter:
+                    self.log.warning(
+                        f'Filter "{fir_filter_bw}" does not match the Smith plant; '
+                        f'using advertised filter "{smith_filter}" for all conditions')
+                    fir_filter_bw = smith_filter
 
             # Configure FIR bypass
             lock_in.fir_bypass_ch1 = fir_bypass
@@ -968,12 +1147,22 @@ class SensitivitySweepLogic(LogicBase):
 
             # Configure filter bandwidth (only effective when bypass is False)
             if not fir_bypass:
-                # Validate filter bandwidth option
-                valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
+                # Validate against the FIRs actually compiled into this image.
+                valid_filters = {
+                    name for name, available in lock_in.filter_capabilities.items()
+                    if available and name != 'fir_bypass'}
+                if '2kHz_minphase' in valid_filters:
+                    valid_filters.add('2kHz')
+                fallback_filter = ('2kHz_minphase'
+                                   if '2kHz_minphase' in valid_filters
+                                   else next(iter(sorted(valid_filters))))
                 if fir_filter_bw not in valid_filters:
+                    if self._stream_parameters.get('filter_sweep'):
+                        raise RuntimeError(f'Comparison filter {fir_filter_bw} is unavailable')
                     self.log.warning(
-                        f'Invalid filter selection "{fir_filter_bw}", using "2kHz_minphase"')
-                    fir_filter_bw = '2kHz_minphase'
+                        f'Invalid filter selection "{fir_filter_bw}", '
+                        f'using "{fallback_filter}"')
+                    fir_filter_bw = fallback_filter
 
                 lock_in.filter_select_ch1 = fir_filter_bw
                 self.log.debug(f'Set filter_select_ch1 = {fir_filter_bw}')
@@ -981,17 +1170,413 @@ class SensitivitySweepLogic(LogicBase):
             # Verify settings were applied
             actual_bypass = lock_in.fir_bypass_ch1
             actual_filter = lock_in.filter_select_ch1
+            # Persist the effective hardware selection, rather than a stale GUI
+            # choice, into the run metadata and subsequent condition records.
+            self._stream_parameters['fir_bypass'] = bool(actual_bypass)
+            self._stream_parameters['fir_filter_bandwidth'] = actual_filter
             self.log.info(f'Lock-in filter configured: bypass={actual_bypass}, filter={actual_filter}')
 
             if actual_bypass != fir_bypass:
+                if self._stream_parameters.get('filter_sweep'):
+                    raise RuntimeError('FIR bypass readback mismatch')
                 self.log.error(f'FIR bypass setting mismatch! Requested {fir_bypass}, got {actual_bypass}')
             if not fir_bypass and actual_filter != fir_filter_bw:
                 self.log.error(f'Filter bandwidth mismatch! Requested {fir_filter_bw}, got {actual_filter}')
 
         except AttributeError as e:
+            if self._stream_parameters.get('filter_sweep'):
+                raise
             self.log.error(f'Failed to access lock-in module: {e}')
         except Exception as e:
+            if self._stream_parameters.get('filter_sweep'):
+                raise
             self.log.error(f'Error configuring lock-in filters: {e}', exc_info=True)
+
+    def _disable_tracking_safely(self) -> None:
+        """Best-effort safe state used after every comparison condition."""
+        try:
+            lock_hw = self._odmr_lock_hw()
+            if lock_hw is not None:
+                lock_hw.enable_lock(False)
+                lock_hw.clear()
+        except Exception as e:
+            self.log.warning('Could not return frequency tracker to its disabled state: %s', e)
+
+    def _controller_snapshot(self, lock_hw) -> Dict[str, Any]:
+        """Collect the controller state without making a particular FPGA ABI mandatory."""
+        snapshot = {}
+        for method_name, key in (
+                ('get_status', 'status'),
+                ('get_constraints', 'constraints')):
+            try:
+                snapshot[key] = getattr(lock_hw, method_name)()
+            except Exception as e:
+                snapshot[key + '_error'] = str(e)
+        try:
+            snapshot['max_correction_hz'] = lock_hw.get_max_correction_hz()
+        except Exception as e:
+            snapshot['max_correction_error'] = str(e)
+        try:
+            pyrpl_instance = getattr(lock_hw, '_pyrpl', None)
+            if pyrpl_instance is not None:
+                lockin = pyrpl_instance.rp.lockin
+                snapshot['fpga_profile'] = lockin.capabilities
+                snapshot['filter_capabilities'] = lockin.filter_capabilities
+                snapshot['filter_select_ch1'] = lockin.filter_select_ch1
+                snapshot['fir_bypass_ch1'] = bool(lockin.fir_bypass_ch1)
+        except Exception as e:
+            snapshot['fpga_profile_error'] = str(e)
+        return json_safe(snapshot)
+
+    def _raw_discriminator_slope(self, fitted_slope: float) -> Tuple[float, float]:
+        """Undo finite-sampler display calibration for the raw FPGA controller."""
+        scale = 1.0
+        try:
+            scanner = self._odmr_logic()._data_scanner()
+            scale = (float(getattr(scanner, '_calibration_factor', 1.0)) *
+                     float(getattr(scanner, '_signal_scale', 1.0)))
+        except Exception as e:
+            self.log.warning('Could not inspect finite-sampler calibration: %s', e)
+        if not np.isfinite(scale) or scale == 0:
+            raise ValueError(f'invalid finite-sampler discriminator scale {scale!r}')
+        return float(fitted_slope) / scale, scale
+
+    def _configure_tracking_condition(self, condition: Dict[str, Any],
+                                      signed_slope: float):
+        """Apply one open/conventional/Smith condition and return its hardware."""
+        lock_hw = self._odmr_lock_hw()
+        if lock_hw is None:
+            raise RuntimeError(
+                'tracking comparison requested but odmr_lock_hw is not connected')
+
+        lock_hw.enable_lock(False)
+        if hasattr(lock_hw, 'prepare_legacy_single_resonance'):
+            lock_hw.prepare_legacy_single_resonance()
+        lock_hw.clear()
+
+        algorithm = condition['controller_algorithm']
+        if algorithm == 'disabled':
+            return lock_hw
+
+        kwargs = {}
+        if algorithm == 'smith_linear':
+            kwargs['smith_gain_multiplier'] = condition['smith_gain_multiplier']
+            if condition['smith_delay_samples'] is not None:
+                kwargs['smith_delay_samples'] = condition['smith_delay_samples']
+        lock_hw.set_tracking_algorithm(algorithm, **kwargs)
+
+        max_correction = float(
+            self._stream_parameters.get('tracking_max_correction_hz', 50e6))
+        lock_hw.set_max_correction_hz(max_correction)
+        lock_hw.set_bandwidth(
+            float(condition['controller_bandwidth_hz']), abs(float(signed_slope)))
+        lock_hw.clear()
+        lock_hw.enable_lock(True)
+        return lock_hw
+
+    def _acquire_timestamped_tracking_events(self, closed_loop: bool,
+                                              lock_hw=None):
+        """Acquire raw Region-11 events without passing through the display buffer."""
+        ts_logic = self._time_series_logic()
+        if ts_logic.module_state() == 'locked':
+            ts_logic.stop_reading()
+            time.sleep(0.2)
+        streamer = ts_logic._streamer()
+        data_streamer = getattr(streamer, '_data_streamer', None)
+        if data_streamer is None:
+            raise RuntimeError('the configured streamer has no Region-11 data streamer')
+
+        sources = ('fir', 'correction') if closed_loop else ('fir',)
+        duration = (float(self._stream_parameters.get('n_time_traces', 32)) *
+                    float(self._stream_parameters.get('trace_duration', 1.0)))
+        reader = data_streamer.subscribe(
+            sources=sources,
+            ring_bytes=int(self._stream_parameters.get('stream_ring_bytes', 0)),
+            coalesce_us=int(self._stream_parameters.get('stream_coalesce_us', 0)))
+        chunks = []
+        transport_stats = {}
+        fpga_stats = {}
+        controller_status_history = []
+        started = time.monotonic()
+        status_poll_interval = float(
+            self._stream_parameters.get('tracking_status_poll_interval_s', 0.2))
+        next_status_poll = started
+        try:
+            deadline = started + duration
+            while time.monotonic() < deadline:
+                if not self._sleep_interruptible(
+                        min(0.05, max(0.0, deadline - time.monotonic())),
+                        check_interval=0.05):
+                    raise InterruptedError('tracking stream acquisition interrupted')
+                events = reader.read_events()
+                if events.size:
+                    chunks.append(events)
+                if reader.error is not None:
+                    raise RuntimeError(f'stream receiver failed: {reader.error}')
+                now = time.monotonic()
+                if closed_loop and lock_hw is not None and now >= next_status_poll:
+                    try:
+                        status = dict(lock_hw.get_status())
+                        status['acquisition_time_s'] = now - started
+                        controller_status_history.append(json_safe(status))
+                    except Exception as e:
+                        controller_status_history.append({
+                            'acquisition_time_s': now - started,
+                            'read_error': str(e),
+                        })
+                    next_status_poll = now + max(0.02, status_poll_interval)
+            tail = reader.read_events()
+            if tail.size:
+                chunks.append(tail)
+            transport_stats = reader.stats()
+            fpga_stats = data_streamer.stats()
+        finally:
+            data_streamer.unsubscribe(reader)
+
+        events = (np.concatenate(chunks)
+                  if chunks else np.empty(0, dtype=data_streamer.EVENT_DTYPE))
+        if not events.size:
+            raise RuntimeError('no FPGA stream events were received')
+
+        reconstruction = data_streamer.reconstruct_tracking(
+            events, nslots=1, interval=int(streamer._demod_decimation),
+            correction_converter=streamer.ftw_to_hz)
+        error_signal = reconstruction['err'][0]
+        correction_hz = reconstruction['corr'][0] if closed_loop else None
+
+        # Single-resonance operation should advertise a live acquisition window.
+        # Retain a diagnostic fallback for images predating that flag so the raw
+        # FIR samples are not discarded merely because a metadata bit is absent.
+        if error_signal.size and not np.any(np.isfinite(error_signal)):
+            fir_events = data_streamer.select(events, 'fir')
+            fir_ticks = data_streamer.unwrap_counter(fir_events['timestamp'])
+            origin = int(reconstruction['ticks'][0])
+            fir_index = np.rint(
+                (fir_ticks.astype(np.int64) - origin) /
+                float(streamer._demod_decimation)).astype(np.int64)
+            error_signal = np.full(reconstruction['ticks'].size, np.nan)
+            keep = (fir_index >= 0) & (fir_index < error_signal.size)
+            error_signal[fir_index[keep]] = fir_events['data'][keep]
+            self.log.warning(
+                'FIR live-window flag was absent; used the timestamp grid directly.')
+
+        ticks = reconstruction['ticks']
+        time_s = ((ticks - ticks[0]).astype(np.float64) /
+                  float(data_streamer.timestamp_clock_hz))
+        diagnostics = {
+            'requested_duration_s': duration,
+            'wall_duration_s': time.monotonic() - started,
+            'event_count': int(events.size),
+            'observed_event_rate_hz': float(events.size / max(duration, 1e-12)),
+            'event_payload_rate_MBps': float(
+                events.size * data_streamer.EVENT_DTYPE.itemsize /
+                max(duration, 1e-12) / 1e6),
+            'fir_event_count': int(data_streamer.select(events, 'fir').size),
+            'correction_event_count': int(
+                data_streamer.select(events, 'correction').size),
+            'transport': json_safe(transport_stats),
+            'fpga': json_safe(fpga_stats),
+            'controller_status_history': controller_status_history,
+        }
+        return time_s, error_signal, correction_hz, events, diagnostics
+
+    def _analyse_field_trace(self, field_nt: np.ndarray, sample_rate_hz: float,
+                             filename_prefix: str) -> Dict[str, Any]:
+        """Save/plot a gap-free field trace and return its ASD noise floor."""
+        field_nt = np.asarray(field_nt, dtype=np.float64)
+        finite = np.isfinite(field_nt)
+        if not np.any(finite):
+            return {'sensitivity': np.nan, 'sensitivity_rms': np.nan,
+                    'frequencies': np.empty(0), 'asd_hanning': np.empty(0),
+                    'internal_missing_samples': int(field_nt.size)}
+
+        first, last = np.flatnonzero(finite)[[0, -1]]
+        trimmed = field_nt[first:last + 1]
+        internal_missing = int(np.count_nonzero(~np.isfinite(trimmed)))
+        if internal_missing:
+            self.log.error(
+                'Refusing to calculate a lossless ASD for %s: %d internal samples missing.',
+                filename_prefix, internal_missing)
+            return {'sensitivity': np.nan, 'sensitivity_rms': np.nan,
+                    'frequencies': np.empty(0), 'asd_hanning': np.empty(0),
+                    'internal_missing_samples': internal_missing}
+
+        duration = trimmed.size / float(sample_rate_hz)
+        result = plot_asds(
+            trimmed, float(sample_rate_hz), duration,
+            float(self._stream_parameters.get('f_enbw', self._default_f_enbw)),
+            save_fig=True, save_data=True, filename_prefix=filename_prefix,
+            sensitivity_f_min=float(
+                self._stream_parameters.get('sensitivity_f_min', 200.0)),
+            sensitivity_f_max=float(
+                self._stream_parameters.get('sensitivity_f_max', 1400.0)),
+            exclude_50hz_harmonics=bool(
+                self._stream_parameters.get('exclude_50hz_harmonics', True)))
+        result['internal_missing_samples'] = 0
+        return result
+
+    def _measure_tracking_condition(self, point_folder: str, condition_index: int,
+                                    condition: Dict[str, Any], signed_slope: float):
+        """Configure, acquire, analyse and save one controller comparison run."""
+        algorithm = condition['controller_algorithm']
+        tag_parts = [f'{condition_index:02d}', condition['measurement_mode'], algorithm]
+        if condition['controller_bandwidth_hz'] is not None:
+            tag_parts.append(f'bw{condition["controller_bandwidth_hz"]:g}Hz')
+        if condition['smith_gain_multiplier'] is not None:
+            tag_parts.append(f'x{condition["smith_gain_multiplier"]:g}')
+        if condition['smith_delay_samples'] is not None:
+            tag_parts.append(f'd{int(condition["smith_delay_samples"])}')
+        condition_tag = '_'.join(tag_parts)
+        condition_folder = os.path.join(point_folder, condition_tag)
+        os.makedirs(condition_folder, exist_ok=True)
+
+        lock_hw = self._configure_tracking_condition(condition, signed_slope)
+        before = self._controller_snapshot(lock_hw)
+        if algorithm != 'disabled':
+            settling = float(
+                self._stream_parameters.get('tracking_settling_time_s', 1.0))
+            if settling > 0 and not self._sleep_interruptible(settling):
+                raise InterruptedError('controller settling interrupted')
+
+        try:
+            time_s, error_signal, correction_hz, events, diagnostics = \
+                self._acquire_timestamped_tracking_events(
+                    closed_loop=(algorithm != 'disabled'), lock_hw=lock_hw)
+            after = self._controller_snapshot(lock_hw)
+        finally:
+            self._disable_tracking_safely()
+
+        inverted = False
+        try:
+            inverted = bool(lock_hw.get_invert())
+        except Exception:
+            pass
+        traces = reconstruct_field_traces(
+            error_signal, correction_hz, signed_slope,
+            correction_inverted=inverted)
+        sample_rate = float(self._time_series_logic().sampling_rate)
+        finite_correction = np.abs(
+            traces['correction_frequency_hz'][
+                np.isfinite(traces['correction_frequency_hz'])])
+        correction_peak_hz = (float(np.max(finite_correction))
+                              if finite_correction.size else 0.0)
+        correction_limit_hz = before.get('max_correction_hz')
+        correction_limit_hit = bool(
+            correction_limit_hz is not None and correction_limit_hz > 0 and
+            correction_peak_hz >= 0.999 * float(correction_limit_hz))
+
+        trace_path = os.path.join(condition_folder, 'tracking_time_trace.npz')
+        np.savez_compressed(
+            trace_path,
+            time_s=time_s,
+            discriminator_signal=error_signal,
+            sample_rate_hz=sample_rate,
+            **traces)
+        if bool(self._stream_parameters.get('save_raw_stream_events', True)):
+            np.save(os.path.join(condition_folder, 'raw_stream_events.npy'), events)
+
+        estimate_asd = self._analyse_field_trace(
+            traces['estimated_field_nt'], sample_rate,
+            os.path.join(condition_folder, 'estimated_field'))
+        residual_asd = self._analyse_field_trace(
+            traces['residual_field_nt'], sample_rate,
+            os.path.join(condition_folder, 'residual_field'))
+        if algorithm == 'disabled':
+            correction_asd = {'sensitivity': 0.0, 'sensitivity_rms': 0.0}
+        else:
+            correction_asd = self._analyse_field_trace(
+                traces['correction_field_nt'], sample_rate,
+                os.path.join(condition_folder, 'correction_field'))
+
+        relevant_sources = ('fir', 'correction') if algorithm != 'disabled' else ('fir',)
+        source_overflows = diagnostics['fpga'].get('source_overflows', {})
+        transport_lossless = (
+            int(diagnostics['transport'].get('n_gap', 0)) == 0 and
+            int(diagnostics['transport'].get('n_seq_skips', 0)) == 0 and
+            int(diagnostics['fpga'].get('fpga_overflows', 0)) == 0 and
+            all(int(source_overflows.get(source, 0)) == 0
+                for source in relevant_sources) and
+            int(estimate_asd.get('internal_missing_samples', 0)) == 0)
+        measurement_valid = transport_lossless and not correction_limit_hit
+        if not measurement_valid:
+            self.log.error(
+                '%s marked invalid (transport_lossless=%s, correction_limit_hit=%s).',
+                condition_tag, transport_lossless, correction_limit_hit)
+
+        metadata = {
+            'schema_version': 1,
+            'created': datetime.now().isoformat(),
+            'condition': condition,
+            'signed_discriminator_slope_per_hz': signed_slope,
+            'correction_inverted_for_lower_sideband': inverted,
+            'sample_rate_hz': sample_rate,
+            'stream_diagnostics': diagnostics,
+            'controller_before_acquisition': before,
+            'controller_after_acquisition': after,
+            'trace_file': os.path.basename(trace_path),
+            'raw_event_file': ('raw_stream_events.npy' if bool(
+                self._stream_parameters.get('save_raw_stream_events', True)) else None),
+            'sensitivity_nT_rtHz': estimate_asd['sensitivity'],
+            'residual_sensitivity_nT_rtHz': residual_asd['sensitivity'],
+            'correction_sensitivity_nT_rtHz': correction_asd['sensitivity'],
+            'correction_peak_hz': correction_peak_hz,
+            'correction_limit_hit': correction_limit_hit,
+            'transport_lossless': transport_lossless,
+            'measurement_valid': measurement_valid,
+        }
+        with open(os.path.join(condition_folder, 'measurement_metadata.json'), 'w') as handle:
+            json.dump(json_safe(metadata), handle, indent=2, allow_nan=False)
+
+        result = dict(condition)
+        status_history = diagnostics['controller_status_history']
+        valid_status = [status for status in status_history
+                        if 'read_error' not in status]
+        actual_smith_delay = None
+        if algorithm == 'smith_linear':
+            actual_smith_delay = before.get('status', {}).get(
+                'smith_delay_samples', condition['smith_delay_samples'])
+        result.update({
+            'condition_folder': os.path.relpath(condition_folder, self._current_folder),
+            'sensitivity_nT_rtHz': float(
+                estimate_asd['sensitivity']) if measurement_valid else np.nan,
+            'sensitivity_rms_nT_rtHz': float(
+                estimate_asd.get('sensitivity_rms', np.nan))
+                if measurement_valid else np.nan,
+            'residual_sensitivity_nT_rtHz': float(
+                residual_asd['sensitivity']) if measurement_valid else np.nan,
+            'correction_sensitivity_nT_rtHz': float(
+                correction_asd['sensitivity']) if measurement_valid else np.nan,
+            'measurement_valid': measurement_valid,
+            'transport_lossless': transport_lossless,
+            'missing_samples': int(
+                estimate_asd.get('internal_missing_samples', 0)),
+            'stream_event_count': diagnostics['event_count'],
+            'stream_fir_event_count': diagnostics['fir_event_count'],
+            'stream_correction_event_count': diagnostics['correction_event_count'],
+            'stream_event_rate_hz': diagnostics['observed_event_rate_hz'],
+            'stream_event_payload_MBps': diagnostics['event_payload_rate_MBps'],
+            'stream_transport_gap_words': diagnostics['transport'].get('n_gap', 0),
+            'stream_sequence_skips': diagnostics['transport'].get('n_seq_skips', 0),
+            'stream_fpga_overflows': diagnostics['fpga'].get('fpga_overflows', 0),
+            'smith_delay_samples_actual': actual_smith_delay,
+            'controller_mu_hz_per_lsb': before.get('status', {}).get(
+                'mu_hz_per_lsb'),
+            'controller_any_saturated': any(
+                bool(status.get('saturated', False)) for status in valid_status) or
+                correction_limit_hit,
+            'controller_correction_peak_hz': correction_peak_hz,
+            'controller_correction_limit_hit': correction_limit_hit,
+            'controller_locked_fraction': (
+                float(np.mean([bool(status.get('locked', False))
+                               for status in valid_status]))
+                if valid_status else np.nan),
+        })
+        self.log.info(
+            '%s sensitivity: total %.3f, residual %.3f, correction %.3f nT/sqrtHz',
+            condition_tag, result['sensitivity_nT_rtHz'],
+            result['residual_sensitivity_nT_rtHz'],
+            result['correction_sensitivity_nT_rtHz'])
+        return result, estimate_asd['frequencies'], estimate_asd['asd_hanning']
 
     def _measure_sensitivity(self, filename_prefix: str, slope: float
                             ) -> Tuple[float, float, np.ndarray, np.ndarray]:
@@ -1314,11 +1899,36 @@ class SensitivitySweepLogic(LogicBase):
             sensitivity_f_max = self._stream_parameters.get('sensitivity_f_max', 1400.0)
             exclude_50hz = self._stream_parameters.get('exclude_50hz_harmonics', True)
 
+            conditions_per_point = 1
+            if self._stream_parameters.get('tracking_comparison_enabled', False):
+                conditions_per_point = len(build_tracking_conditions(
+                    self._stream_parameters.get('tracking_modes', ['open_loop']),
+                    self._stream_parameters.get('controller_bandwidths_hz', [300.0]),
+                    self._stream_parameters.get('smith_gain_multipliers', [4.0]),
+                    self._stream_parameters.get('smith_delay_samples', [None])))
+                if include_off_resonant:
+                    conditions_per_point += 1
+            profiles = self._stream_parameters.get('filter_sweep') or [{}]
+            conditions_per_filter = {}
+            for profile in profiles:
+                parameters = dict(self._stream_parameters, **profile)
+                count = 1
+                if parameters.get('tracking_comparison_enabled', False):
+                    count = len(build_tracking_conditions(
+                        parameters.get('tracking_modes', ['open_loop']),
+                        parameters.get('controller_bandwidths_hz', [300.0]),
+                        parameters.get('smith_gain_multipliers', [4.0]),
+                        parameters.get('smith_delay_samples', [None]))) + int(include_off_resonant)
+                conditions_per_filter[parameters.get('fir_filter_bandwidth', 'unknown')] = count
             metadata = {
                 'total_measurements': len(self._results_list),
-                'total_planned': self._total_combinations,
+                'total_planned_hyperfine_scans': self._total_combinations * len(profiles),
+                'conditions_per_hyperfine_scan': (conditions_per_point if len(profiles) == 1 else None),
+                'conditions_per_filter': conditions_per_filter,
+                'total_planned_measurements': (
+                    self._total_combinations * sum(conditions_per_filter.values())),
                 'best_sensitivity_nT_rtHz': float(self._best_sensitivity),
-                'best_parameters': {k: float(v) for k, v in self._best_parameters.items()},
+                'best_parameters': self._best_parameters,
                 'sweep_loop_order': self._sweep_loop_order,
                 'thermal_stabilization_time_s': self._thermal_stabilization_time,
                 'which_zero_crossing': self._which_zero_crossing,
@@ -1333,7 +1943,7 @@ class SensitivitySweepLogic(LogicBase):
 
             json_path = os.path.join(self._current_folder, 'sweep_metadata.json')
             with open(json_path, 'w') as f:
-                json.dump(metadata, f, indent=4)
+                json.dump(json_safe(metadata), f, indent=4, allow_nan=False)
 
             self.log.info(f'Results saved to {self._current_folder}')
 
@@ -1358,7 +1968,7 @@ class SensitivitySweepLogic(LogicBase):
             # Build metadata dict with current state
             metadata = {
                 'best_sensitivity_nT_rtHz': float(self._best_sensitivity),
-                'best_parameters': {k: float(v) for k, v in self._best_parameters.items()},
+                'best_parameters': self._best_parameters.copy(),
                 'sweep_loop_order': self._sweep_loop_order,
                 'total_measurements': len(self._results_list),
                 'total_planned': self._total_combinations

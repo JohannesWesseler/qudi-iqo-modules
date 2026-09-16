@@ -1072,7 +1072,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
                                f"stream so it uses the marked bitstream.")
         os.makedirs(os.path.dirname(self._field_log_path) or '.', exist_ok=True)
         hw.begin_field_drain()
-        self._field_rate = float(getattr(hw, 'stream_sample_rate', 125e6 / 4096))
+        self._field_rate = float(hw.stream_sample_rate)
         self._field_words_per_sample = int(getattr(hw, 'stream_words_per_sample', 3))
         self._field_tail_words = np.empty(0, dtype=np.float64)
         self._field_sample_base = 0
@@ -1125,7 +1125,9 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
         cut_idx = max(0, min(int(cut_idx), n_samp))
         if events:
             rows = np.empty(len(events), dtype=self._FIELD_DTYPE)
-            rate = self._field_rate or (125e6 / 4096)
+            if not self._field_rate:
+                raise RuntimeError('FPGA stream sample rate is unavailable')
+            rate = self._field_rate
             base = self._field_sample_base
             for i, (center, slot, corr_mean, err_mean, cnt) in enumerate(events):
                 rows['t_s'][i] = (base + center) / rate

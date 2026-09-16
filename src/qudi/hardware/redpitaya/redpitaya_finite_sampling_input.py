@@ -14,6 +14,49 @@ from qudi.interface.finite_sampling_input_interface import FiniteSamplingInputIn
 from .resource_manager import get_pyrpl_instance, release_pyrpl_instance
 
 
+def _calculate_scan_timing(requested_rate_hz, trigger_time_s, settling_time_s,
+                           fpga_clock_hz, valid_period_cycles=None,
+                           minimum_valid_samples=1):
+    """Quantize a point and guarantee its finite acquisition window.
+
+    Demodulated data reaches the scan accumulator only on the lock-in valid
+    strobe. A positive dwell shorter than one strobe period can therefore
+    contain no samples, depending on phase. Work in FPGA cycles so the
+    guarantee matches the hardware counters exactly.
+    """
+    fpga_clock_hz = int(fpga_clock_hz)
+    requested_rate_hz = float(requested_rate_hz)
+    if fpga_clock_hz <= 0 or requested_rate_hz <= 0:
+        raise ValueError('FPGA clock and requested scan rate must be positive')
+
+    trigger_cycles = max(0, int(round(float(trigger_time_s) * fpga_clock_hz)))
+    settling_cycles = max(0, int(round(float(settling_time_s) * fpga_clock_hz)))
+    requested_total_cycles = max(1, int(round(fpga_clock_hz / requested_rate_hz)))
+    requested_dwell_cycles = requested_total_cycles - trigger_cycles - settling_cycles
+
+    minimum_dwell_cycles = 1
+    if valid_period_cycles is not None:
+        valid_period_cycles = int(valid_period_cycles)
+        minimum_valid_samples = max(1, int(minimum_valid_samples))
+        if valid_period_cycles <= 0:
+            raise ValueError('valid period must be positive')
+        minimum_dwell_cycles = minimum_valid_samples * valid_period_cycles
+
+    dwell_cycles = max(minimum_dwell_cycles, requested_dwell_cycles)
+    actual_total_cycles = trigger_cycles + settling_cycles + dwell_cycles
+    return {
+        'trigger_cycles': trigger_cycles,
+        'settling_cycles': settling_cycles,
+        'dwell_cycles': dwell_cycles,
+        'dwell_time_s': dwell_cycles / float(fpga_clock_hz),
+        'actual_rate_hz': fpga_clock_hz / float(actual_total_cycles),
+        'rate_limited': dwell_cycles > requested_dwell_cycles,
+        'guaranteed_valid_samples': (
+            dwell_cycles // valid_period_cycles
+            if valid_period_cycles is not None else dwell_cycles),
+    }
+
+
 class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
     """
     A Red Pitaya device using pyrpl scan module for finite sampling input.
@@ -46,9 +89,13 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
     # Config options
     _redpitaya_config_name = ConfigOption('redpitaya_config_name', default='rpy_shared_config', missing='info')
     _redpitaya_hostname = ConfigOption('redpitaya_hostname', missing='error')
+    _redpitaya_fpga_filename = ConfigOption(
+        'redpitaya_fpga_filename', default=None, missing='info')
     _calibration_factor = ConfigOption('calibration_factor', default=1.0, missing='info')
     _trigger_output_duration = ConfigOption('trigger_output_duration', default=50e-6, missing='info')
     _settling_time = ConfigOption('settling_time', default=100e-6, missing='info')
+    _minimum_demod_samples_per_point = ConfigOption(
+        'minimum_demod_samples_per_point', default=16, missing='info')
     _input_channel = ConfigOption('input_channel', default='in1', missing='info')
     _signal_scale = ConfigOption('signal_scale', default=1.0, missing='info')
     _input_select = ConfigOption('input_select', default='adc', missing='info')  # 'adc', 'iq0', or 'demod'
@@ -73,6 +120,10 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
 
         self._thread_lock = RecursiveMutex()
         self._sample_rate = 1000.0  # Hz
+        self._requested_sample_rate = self._sample_rate
+        self._actual_sample_rate = self._sample_rate
+        self._fpga_clock_hz = 125_000_000
+        self._demod_sample_period_cycles = 4096
         self._frame_size = 100
         self._active_channel = 'ch1'
         self._constraints = None
@@ -87,13 +138,20 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             # Use the shared factory to get a pyrpl instance
             self._pyrpl, _ = get_pyrpl_instance(
                 hostname=self._redpitaya_hostname,
-                config_name=self._redpitaya_config_name
+                config_name=self._redpitaya_config_name,
+                fpga_filename=self._redpitaya_fpga_filename
             )
             self.log.info(f'Acquired shared pyrpl instance for {self._redpitaya_hostname}')
 
             # Get the scan module
             self._scan_module = self._pyrpl.rp.scan
             self._hk_module   = self._pyrpl.rp.hk
+            lock_caps = self._pyrpl.rp.lockin.require_compatible_firmware()
+            self._fpga_clock_hz = int(lock_caps['fpga_clock_hz'])
+            self._demod_sample_period_cycles = int(
+                lock_caps['sample_period_cycles'])
+            self._minimum_demod_samples_per_point = max(
+                1, int(self._minimum_demod_samples_per_point))
 
             self._hk_module.configure_pin('P7', direction='output', source='module', invert=True)
             self.log.info("Configured trigger pin P7 (DIO7_P) as an inverted module output.")
@@ -127,6 +185,8 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             )
 
             self._sample_rate = 1000.0
+            self._requested_sample_rate = self._sample_rate
+            self._actual_sample_rate = self._sample_rate
             self._frame_size = min(100, self._constraints.max_frame_size)
 
             self.log.info('Connected to Red Pitaya scan module')
@@ -181,7 +241,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             return len(self._data_buffer) - self._buffer_position
 
     def set_sample_rate(self, rate):
-        """Set the sample rate (affects dwell time per point)."""
+        """Set the requested point rate and expose the achievable FPGA rate."""
         rate = float(rate)
         assert self._constraints.sample_rate_in_range(rate)[0], \
             f'Sample rate {rate} Hz out of bounds'
@@ -189,8 +249,28 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
         with self._thread_lock:
             assert self.module_state() == 'idle', \
                 'Cannot change sample rate during acquisition'
-            self._sample_rate = rate
-            self.log.debug(f'Sample rate set to {rate} Hz')
+            timing = _calculate_scan_timing(
+                requested_rate_hz=rate,
+                trigger_time_s=self._trigger_output_duration,
+                settling_time_s=self._settling_time,
+                fpga_clock_hz=self._fpga_clock_hz,
+                valid_period_cycles=(self._demod_sample_period_cycles
+                                     if self._input_select == 'demod' else None),
+                minimum_valid_samples=self._minimum_demod_samples_per_point)
+            self._requested_sample_rate = rate
+            self._sample_rate = timing['actual_rate_hz']
+            self._actual_sample_rate = self._sample_rate
+            if timing['rate_limited']:
+                self.log.warning(
+                    'Requested scan rate %.1f Hz cannot fit %.1f us trigger + '
+                    '%.1f us settling + %d valid %s samples. Clamping the '
+                    'hardware point rate to %.1f Hz (%.1f us acquisition dwell).',
+                    rate, self._trigger_output_duration * 1e6,
+                    self._settling_time * 1e6,
+                    timing['guaranteed_valid_samples'], self._input_select,
+                    self._sample_rate, timing['dwell_time_s'] * 1e6)
+            else:
+                self.log.debug('Sample rate set to %.3f Hz', self._sample_rate)
 
     def set_active_channels(self, channels):
         """Set active channels (only one channel supported currently)."""
@@ -224,24 +304,29 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             # Configure scan module
             self._scan_module.num_steps = self._frame_size
 
-            # Calculate timing parameters
-            # Total time per point = 1 / sample_rate
-            # This includes: trigger_time + settling_time + dwell_time
-            total_time_per_point = 1.0 / self._sample_rate
-
-            # Fixed times (from config)
             trigger_time = self._trigger_output_duration
             settling_time = self._settling_time
+            timing = _calculate_scan_timing(
+                requested_rate_hz=self._sample_rate,
+                trigger_time_s=trigger_time,
+                settling_time_s=settling_time,
+                fpga_clock_hz=self._fpga_clock_hz,
+                valid_period_cycles=(self._demod_sample_period_cycles
+                                     if self._input_select == 'demod' else None),
+                minimum_valid_samples=self._minimum_demod_samples_per_point)
+            dwell_time = timing['dwell_time_s']
+            self._actual_sample_rate = timing['actual_rate_hz']
 
-            # Calculate dwell time
-            dwell_time = total_time_per_point - trigger_time - settling_time
-
-            if dwell_time < 8e-9:  # Minimum 1 FPGA clock cycle
-                self.log.warning(f'Sample rate {self._sample_rate} Hz too high for configured timing. '
-                                 f'Minimum dwell time will be used.')
-                dwell_time = 1e-6  # 1 microsecond minimum
-                actual_rate = 1.0 / (trigger_time + settling_time + dwell_time)
-                self.log.warning(f'Actual sample rate will be {actual_rate:.1f} Hz')
+            if timing['rate_limited']:
+                # Defensive path for timing options changed after set_sample_rate.
+                self.log.warning(
+                    'Requested scan rate %.1f Hz leaves too little acquisition '
+                    'time after %.1f us trigger + %.1f us settling. Using %.1f us '
+                    'dwell and %.1f Hz actual rate to guarantee at least %d %s '
+                    'samples per point.',
+                    self._sample_rate, trigger_time * 1e6, settling_time * 1e6,
+                    dwell_time * 1e6, self._actual_sample_rate,
+                    timing['guaranteed_valid_samples'], self._input_select)
 
             self._scan_module.dwell_time = dwell_time
             self._scan_module.trigger_length = trigger_time
@@ -257,7 +342,8 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             self.log.debug(f'Started scan: {self._frame_size} steps, '
                            f'dwell={dwell_time * 1e6:.1f}us, '
                            f'trigger={trigger_time * 1e6:.1f}us, '
-                           f'settling={settling_time * 1e6:.1f}us')
+                           f'settling={settling_time * 1e6:.1f}us, '
+                           f'actual_rate={self._actual_sample_rate:.1f}Hz')
 
         except Exception as e:
             self.module_state.unlock()
@@ -294,8 +380,8 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
         # Wait for scan to complete if still running
         if self.module_state() == 'locked' and self._data_buffer is None:
             # Calculate timeout based on configured timing
-            time_per_sample = 1.0 / self._sample_rate
-            timeout = (self._frame_size * time_per_sample) + 1.0
+            time_per_sample = 1.0 / self._actual_sample_rate
+            timeout = (self._frame_size * time_per_sample) + 2.0
 
             self.log.debug(f'Waiting for scan completion (timeout={timeout:.1f}s)')
 
@@ -400,19 +486,27 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             lock_in.fir_bypass_ch1 = self._lock_in_fir_bypass_ch1
             lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
 
-            # Configure filter selection (only active when FIR bypass is False)
-            valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
+            # Derive selections from the loaded FPGA profile so an invalid
+            # setting cannot fall back to a FIR absent from the fast image.
+            valid_filters = {
+                name for name, available in lock_in.filter_capabilities.items()
+                if available and name != 'fir_bypass'}
+            if '2kHz_minphase' in valid_filters:
+                valid_filters.add('2kHz')  # legacy alias
+            fallback_filter = ('2kHz_minphase'
+                               if '2kHz_minphase' in valid_filters
+                               else next(iter(sorted(valid_filters))))
 
             if self._lock_in_filter_ch1 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
-                                 f'Using "2kHz_minphase". Valid options: {valid_filters}')
-                self._lock_in_filter_ch1 = '2kHz_minphase'
+                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
+                self._lock_in_filter_ch1 = fallback_filter
             lock_in.filter_select_ch1 = self._lock_in_filter_ch1
 
             if self._lock_in_filter_ch2 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
-                                 f'Using "2kHz_minphase". Valid options: {valid_filters}')
-                self._lock_in_filter_ch2 = '2kHz_minphase'
+                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
+                self._lock_in_filter_ch2 = fallback_filter
             lock_in.filter_select_ch2 = self._lock_in_filter_ch2
 
             # Configure demodulation bypass (DC ODMR mode)

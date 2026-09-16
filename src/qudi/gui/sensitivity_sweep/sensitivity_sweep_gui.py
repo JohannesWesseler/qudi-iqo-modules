@@ -76,6 +76,7 @@ class SensitivitySweepGui(GuiBase):
     _f_mod_min = StatusVar('f_mod_min', default=16e3)
     _f_mod_max = StatusVar('f_mod_max', default=25e3)
     _f_mod_points = StatusVar('f_mod_points', default=5)
+    _f_mod_values_khz = StatusVar('f_mod_values_khz', default='')
 
     # FM deviation sweep parameters
     _f_dev_min = StatusVar('f_dev_min', default=500)
@@ -98,6 +99,20 @@ class SensitivitySweepGui(GuiBase):
     # Lock-in filter parameters
     _fir_bypass = StatusVar('fir_bypass', default=False)
     _fir_filter_bandwidth = StatusVar('fir_filter_bandwidth', default='2kHz_minphase')
+    _compare_wide_filters = StatusVar('compare_wide_filters', default=False)
+    _bandwidths_6k = StatusVar('bandwidths_6k', default='100')
+    _bandwidths_10k = StatusVar('bandwidths_10k', default='100')
+
+    # Open/closed-loop tracking comparison matrix
+    _measure_open_loop = StatusVar('measure_open_loop', default=True)
+    _measure_conventional = StatusVar('measure_conventional', default=True)
+    _measure_smith = StatusVar('measure_smith', default=True)
+    _controller_bandwidths = StatusVar('controller_bandwidths', default='300, 600, 1000')
+    _smith_gain_multipliers = StatusVar('smith_gain_multipliers', default='4')
+    _smith_delay_samples = StatusVar('smith_delay_samples', default='auto')
+    _tracking_settling_time = StatusVar('tracking_settling_time', default=1.0)
+    _tracking_max_correction_mhz = StatusVar('tracking_max_correction_mhz', default=50.0)
+    _save_raw_stream_events = StatusVar('save_raw_stream_events', default=True)
 
     # Off-resonant measurement parameters
     _include_off_resonant = StatusVar('include_off_resonant', default=False)
@@ -310,6 +325,11 @@ class SensitivitySweepGui(GuiBase):
         self._f_mod_points_spinbox.setRange(1, 100)
         self._f_mod_points_spinbox.setValue(self._f_mod_points)
         param_layout.addRow('  Points:', self._f_mod_points_spinbox)
+        self._f_mod_values_edit = QtWidgets.QLineEdit(str(self._f_mod_values_khz))
+        self._f_mod_values_edit.setToolTip(
+            'Optional exact frequencies in kHz, e.g. 15.26, 20, 30. '
+            'Overrides Min/Max/Points; leave empty for a linear sweep.')
+        param_layout.addRow('  Exact values [kHz]:', self._f_mod_values_edit)
 
         # FM deviation parameters
         f_dev_label = QtWidgets.QLabel('<b>FM Deviation [kHz]</b>')
@@ -346,6 +366,7 @@ class SensitivitySweepGui(GuiBase):
         # Update total points when any parameter changes
         for spinbox in [self._power_points_spinbox, self._f_mod_points_spinbox, self._f_dev_points_spinbox]:
             spinbox.valueChanged.connect(self._update_total_points)
+        self._f_mod_values_edit.textChanged.connect(self._update_total_points)
 
         # ODMR scan settings group
         odmr_group = QtWidgets.QGroupBox('ODMR Scan Settings')
@@ -406,13 +427,16 @@ class SensitivitySweepGui(GuiBase):
         stream_layout.addRow('Trace Duration:', self._stream_trace_duration_spinbox)
 
         self._stream_f_enbw_spinbox = QtWidgets.QDoubleSpinBox()
-        self._stream_f_enbw_spinbox.setRange(1, 10000)
+        self._stream_f_enbw_spinbox.setRange(1, 100000)
         self._stream_f_enbw_spinbox.setSuffix(' Hz')
         self._stream_f_enbw_spinbox.setValue(self._stream_f_enbw)
         self._stream_f_enbw_spinbox.setDecimals(1)
         self._stream_f_enbw_spinbox.setToolTip(
             'Equivalent Noise Bandwidth of the lock-in filter.\n'
-            'For Red Pitaya IQ demodulation: ENBW ≈ bandwidth × 1.06'
+            'CIC + FIR design estimates: 6 kHz minimum phase ≈ 6392.1 Hz;\n'
+            '10 kHz minimum phase ≈ 10418.6 Hz.\n'
+            'Used by the time-domain standard-deviation estimate;\n'
+            'the Welch ASD uses its own spectral-density normalization.'
         )
         stream_layout.addRow('Filter ENBW:', self._stream_f_enbw_spinbox)
 
@@ -434,20 +458,28 @@ class SensitivitySweepGui(GuiBase):
         self._fir_filter_combobox.addItems([
             '2 kHz minimum phase',
             '2 kHz linear phase',
+            '20 kHz linear phase (fast /1024 image)',
+            '6 kHz minimum phase',
+            '10 kHz minimum phase',
+            '10 kHz minimum phase (CIC /2048, N=3, M=1)',
         ])
         # Map stored value to combobox index
         _filter_index_map = {
             '2kHz_minphase': 0,
             '2kHz_linear': 1,
+            '20kHz_linear': 2,
+            '6kHz_minphase': 3,
+            '10kHz_minphase': 4,
+            '10kHz_minphase_2048': 5,
             '2kHz': 0,  # migrate the legacy minimum-phase spelling
         }
         filter_index = _filter_index_map.get(self._fir_filter_bandwidth, 0)
         self._fir_filter_combobox.setCurrentIndex(filter_index)
         self._fir_filter_combobox.setToolTip(
             'Select lock-in lowpass filter.\n'
-            'Both choices have the same CIC-compensated 2 kHz magnitude response.\n'
+            'Only filters compiled into the loaded image can be selected.\n'
             'Minimum phase: established low-latency response.\n'
-            'Linear phase: constant 1.933 ms FIR group delay.'
+            'Linear phase: constant group delay, required by the current Smith model.'
         )
         stream_layout.addRow('  Filter:', self._fir_filter_combobox)
 
@@ -456,6 +488,95 @@ class SensitivitySweepGui(GuiBase):
         self._fir_bypass_checkbox.toggled.connect(
             lambda checked: self._fir_filter_combobox.setEnabled(not checked)
         )
+
+        # Tracking comparison settings
+        stream_layout.addRow(QtWidgets.QLabel(''))
+        comparison_label = QtWidgets.QLabel('<b>Open/Closed-Loop Comparison</b>')
+        stream_layout.addRow(comparison_label)
+
+        self._measure_open_loop_checkbox = QtWidgets.QCheckBox('Open loop')
+        self._measure_open_loop_checkbox.setChecked(self._measure_open_loop)
+        stream_layout.addRow(self._measure_open_loop_checkbox)
+        self._measure_conventional_checkbox = QtWidgets.QCheckBox(
+            'Closed loop: conventional controller')
+        self._measure_conventional_checkbox.setChecked(self._measure_conventional)
+        stream_layout.addRow(self._measure_conventional_checkbox)
+        self._measure_smith_checkbox = QtWidgets.QCheckBox(
+            'Closed loop: Smith compensator')
+        self._measure_smith_checkbox.setChecked(self._measure_smith)
+        stream_layout.addRow(self._measure_smith_checkbox)
+
+        self._controller_bandwidths_edit = QtWidgets.QLineEdit(
+            str(self._controller_bandwidths))
+        self._controller_bandwidths_edit.setToolTip(
+            'Comma-separated base controller bandwidths in Hz. Each value is measured '
+            'for conventional and selected Smith settings.')
+        stream_layout.addRow('  Bandwidths [Hz]:', self._controller_bandwidths_edit)
+
+        self._smith_gain_multipliers_edit = QtWidgets.QLineEdit(
+            str(self._smith_gain_multipliers))
+        self._smith_gain_multipliers_edit.setToolTip(
+            'Comma-separated Smith gain multipliers, for example 2, 4, 6.')
+        stream_layout.addRow('  Smith gain factors:', self._smith_gain_multipliers_edit)
+
+        self._smith_delay_samples_edit = QtWidgets.QLineEdit(
+            str(self._smith_delay_samples))
+        self._smith_delay_samples_edit.setToolTip(
+            'Comma-separated predictor delays in demodulated samples. Use "auto" '
+            'for the FIR group delay advertised by the FPGA image.')
+        stream_layout.addRow('  Smith delays:', self._smith_delay_samples_edit)
+
+        self._compare_filters_checkbox = QtWidgets.QCheckBox(
+            'Compare 6 kHz and 10 kHz minimum-phase filters')
+        self._compare_filters_checkbox.setChecked(self._compare_wide_filters)
+        self._compare_filters_checkbox.setToolTip(
+            'At each microwave setting, acquire a separate ODMR scan and all selected '
+            'conditions for each filter. Microwave power remains the outer loop. '
+            'Uses the calculated ENBW for each filter; Smith compensation is disabled.')
+        stream_layout.addRow(self._compare_filters_checkbox)
+        self._bandwidths_6k_edit = QtWidgets.QLineEdit(str(self._bandwidths_6k))
+        self._bandwidths_10k_edit = QtWidgets.QLineEdit(str(self._bandwidths_10k))
+        for label, edit in (('6 kHz filter: loop BW [Hz]', self._bandwidths_6k_edit),
+                            ('10 kHz filter: loop BW [Hz]', self._bandwidths_10k_edit)):
+            edit.setToolTip('Comma-separated integral controller bandwidths, e.g. 100, 300.')
+            stream_layout.addRow(label, edit)
+            edit.textChanged.connect(self._update_total_points)
+        self._compare_filters_checkbox.toggled.connect(self._update_filter_comparison)
+        self._fir_filter_combobox.currentIndexChanged.connect(self._update_filter_comparison)
+        self._fir_bypass_checkbox.toggled.connect(self._update_filter_comparison)
+        self._update_filter_comparison()
+
+        self._tracking_settling_spinbox = QtWidgets.QDoubleSpinBox()
+        self._tracking_settling_spinbox.setRange(0.0, 60.0)
+        self._tracking_settling_spinbox.setDecimals(3)
+        self._tracking_settling_spinbox.setSuffix(' s')
+        self._tracking_settling_spinbox.setValue(self._tracking_settling_time)
+        stream_layout.addRow('  Lock settling:', self._tracking_settling_spinbox)
+
+        self._tracking_max_correction_spinbox = QtWidgets.QDoubleSpinBox()
+        self._tracking_max_correction_spinbox.setRange(0.001, 100.0)
+        self._tracking_max_correction_spinbox.setDecimals(3)
+        self._tracking_max_correction_spinbox.setSuffix(' MHz')
+        self._tracking_max_correction_spinbox.setValue(
+            self._tracking_max_correction_mhz)
+        stream_layout.addRow('  Max correction:', self._tracking_max_correction_spinbox)
+
+        self._save_raw_events_checkbox = QtWidgets.QCheckBox(
+            'Save timestamped raw FPGA events')
+        self._save_raw_events_checkbox.setChecked(self._save_raw_stream_events)
+        self._save_raw_events_checkbox.setToolTip(
+            'Recommended for paper measurements. Preserves source IDs, sequence numbers, '
+            'timestamps and raw integer payloads in addition to reconstructed traces.')
+        stream_layout.addRow(self._save_raw_events_checkbox)
+        for checkbox in (self._measure_open_loop_checkbox,
+                         self._measure_conventional_checkbox,
+                         self._measure_smith_checkbox):
+            checkbox.toggled.connect(self._update_total_points)
+        for edit in (self._controller_bandwidths_edit,
+                     self._smith_gain_multipliers_edit,
+                     self._smith_delay_samples_edit):
+            edit.textChanged.connect(self._update_total_points)
+        self._update_total_points()
 
         # Off-resonant measurement option
         stream_layout.addRow(QtWidgets.QLabel(''))  # Spacer
@@ -484,6 +605,8 @@ class SensitivitySweepGui(GuiBase):
         # Enable/disable offset spinbox based on checkbox
         self._off_resonant_offset_spinbox.setEnabled(self._include_off_resonant)
         self._off_resonant_checkbox.toggled.connect(self._off_resonant_offset_spinbox.setEnabled)
+        self._off_resonant_checkbox.toggled.connect(self._update_total_points)
+        self._update_total_points()
 
         # Sensitivity calculation bandwidth settings
         stream_layout.addRow(QtWidgets.QLabel(''))  # Spacer
@@ -686,15 +809,21 @@ class SensitivitySweepGui(GuiBase):
 
         # Create table
         self._results_table = QtWidgets.QTableWidget()
-        self._results_table.setColumnCount(7)
+        self._results_table.setColumnCount(13)
         self._results_table.setHorizontalHeaderLabels([
             'Index',
+            'Mode',
+            'Controller',
+            'BW [Hz]',
+            'Smith gain',
+            'Smith delay',
             'Power [dBm]',
             'f_mod [kHz]',
             'f_dev [kHz]',
             'Linewidth [Hz]',
-            'Slope [V/Hz]',
-            'Sensitivity [nT/√Hz]'
+            'Total sensitivity [nT/√Hz]',
+            'Residual sensitivity [nT/√Hz]',
+            'FIR filter'
         ])
         self._results_table.setSortingEnabled(True)
         self._results_table.horizontalHeader().setStretchLastSection(True)
@@ -817,6 +946,36 @@ class SensitivitySweepGui(GuiBase):
     # GUI Slots - User Actions
     # =========================================================================
 
+    @staticmethod
+    def _parse_positive_list(text, label):
+        try:
+            values = [float(item.strip()) for item in str(text).split(',') if item.strip()]
+        except ValueError as e:
+            raise ValueError(f'{label} must be a comma-separated number list') from e
+        if not values or any(not np.isfinite(value) or value <= 0 for value in values):
+            raise ValueError(f'{label} must contain finite positive values')
+        return values
+
+    @staticmethod
+    def _parse_smith_delays(text):
+        values = []
+        for item in (part.strip().lower() for part in str(text).split(',')):
+            if not item:
+                continue
+            if item == 'auto':
+                value = None
+            else:
+                try:
+                    value = int(item)
+                except ValueError as e:
+                    raise ValueError(
+                        'Smith delays must be comma-separated integers or "auto"') from e
+                if not 1 <= value < 128:
+                    raise ValueError('Smith delays must lie in [1, 127] samples')
+            if value not in values:
+                values.append(value)
+        return values or [None]
+
     @QtCore.Slot()
     def _on_start_sweep(self):
         """Handle start button click."""
@@ -844,10 +1003,59 @@ class SensitivitySweepGui(GuiBase):
         # Lock-in filter settings
         self._fir_bypass = self._fir_bypass_checkbox.isChecked()
         # Map combobox index to PyRPL register key
-        _filter_key_from_index = {0: '2kHz_minphase', 1: '2kHz_linear'}
+        _filter_key_from_index = {
+            0: '2kHz_minphase', 1: '2kHz_linear', 2: '20kHz_linear',
+            3: '6kHz_minphase', 4: '10kHz_minphase', 5: '10kHz_minphase_2048'}
         self._fir_filter_bandwidth = _filter_key_from_index.get(
             self._fir_filter_combobox.currentIndex(), '2kHz_minphase'
         )
+        if self._fir_filter_bandwidth == '10kHz_minphase_2048':
+            self._stream_f_enbw = 10640.924904046242
+
+        self._measure_open_loop = self._measure_open_loop_checkbox.isChecked()
+        self._measure_conventional = self._measure_conventional_checkbox.isChecked()
+        self._measure_smith = self._measure_smith_checkbox.isChecked()
+        tracking_modes = []
+        if self._measure_open_loop:
+            tracking_modes.append('open_loop')
+        if self._measure_conventional:
+            tracking_modes.append('closed_loop_conventional')
+        if self._measure_smith:
+            tracking_modes.append('closed_loop_smith')
+        if not tracking_modes:
+            QtWidgets.QMessageBox.warning(
+                self._mw, 'No measurement selected',
+                'Select at least one open- or closed-loop comparison mode.')
+            return
+        try:
+            f_mod_array = self._f_mod_array_from_widgets()
+            filter_sweep = self._filter_sweep_from_widgets()
+            controller_bandwidths = (
+                self._parse_positive_list(
+                    self._controller_bandwidths_edit.text(), 'Controller bandwidths')
+                if (self._measure_conventional or self._measure_smith) and not filter_sweep
+                else [300.0])
+            smith_gains = (
+                self._parse_positive_list(
+                    self._smith_gain_multipliers_edit.text(), 'Smith gain factors')
+                if self._measure_smith else [4.0])
+            smith_delays = (
+                self._parse_smith_delays(self._smith_delay_samples_edit.text())
+                if self._measure_smith else [None])
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self._mw, 'Invalid tracking matrix', str(e))
+            return
+        self._controller_bandwidths = self._controller_bandwidths_edit.text()
+        self._f_mod_values_khz = self._f_mod_values_edit.text()
+        self._compare_wide_filters = self._compare_filters_checkbox.isChecked()
+        self._bandwidths_6k = self._bandwidths_6k_edit.text()
+        self._bandwidths_10k = self._bandwidths_10k_edit.text()
+        self._smith_gain_multipliers = self._smith_gain_multipliers_edit.text()
+        self._smith_delay_samples = self._smith_delay_samples_edit.text()
+        self._tracking_settling_time = self._tracking_settling_spinbox.value()
+        self._tracking_max_correction_mhz = \
+            self._tracking_max_correction_spinbox.value()
+        self._save_raw_stream_events = self._save_raw_events_checkbox.isChecked()
 
         # Off-resonant measurement settings
         self._include_off_resonant = self._off_resonant_checkbox.isChecked()
@@ -870,7 +1078,6 @@ class SensitivitySweepGui(GuiBase):
             )
             power_array = 10 * np.log10(power_linear)
 
-        f_mod_array = np.linspace(self._f_mod_min, self._f_mod_max, self._f_mod_points)
         f_dev_array = np.linspace(self._f_dev_min, self._f_dev_max, self._f_dev_points)
 
         sweep_params = {
@@ -899,8 +1106,19 @@ class SensitivitySweepGui(GuiBase):
             'off_resonant_offset_hz': self._off_resonant_offset_mhz * 1e6,  # Convert MHz to Hz
             'sensitivity_f_min': self._sensitivity_f_min,
             'sensitivity_f_max': self._sensitivity_f_max,
-            'exclude_50hz_harmonics': self._exclude_50hz_harmonics
+            'exclude_50hz_harmonics': self._exclude_50hz_harmonics,
+            'tracking_comparison_enabled': True,
+            'tracking_modes': tracking_modes,
+            'controller_bandwidths_hz': controller_bandwidths,
+            'smith_gain_multipliers': smith_gains,
+            'smith_delay_samples': smith_delays,
+            'tracking_settling_time_s': self._tracking_settling_time,
+            'tracking_max_correction_hz': self._tracking_max_correction_mhz * 1e6,
+            'save_raw_stream_events': self._save_raw_stream_events,
         }
+
+        if filter_sweep:
+            stream_params['filter_sweep'] = filter_sweep
 
         # Clear results table
         self._results_table.setRowCount(0)
@@ -932,13 +1150,100 @@ class SensitivitySweepGui(GuiBase):
         if reply == QtWidgets.QMessageBox.Yes:
             self.sigCancelSweep.emit()
 
+    def _filter_sweep_from_widgets(self):
+        if not self._compare_filters_checkbox.isChecked():
+            return []
+        return [
+            {'fir_filter_bandwidth': name,
+             'controller_bandwidths_hz': self._parse_positive_list(edit.text(), name + ' loop bandwidths'),
+             'f_enbw': enbw}
+            for name, edit, enbw in (
+                ('6kHz_minphase', self._bandwidths_6k_edit, 6392.1428),
+                ('10kHz_minphase', self._bandwidths_10k_edit, 10418.5833))]
+
+    def _update_filter_comparison(self, *args):
+        compare = self._compare_filters_checkbox.isChecked()
+        new_profile = self._fir_filter_combobox.currentIndex() == 5
+        if new_profile:
+            self._measure_smith_checkbox.setChecked(False)
+            self._stream_f_enbw_spinbox.setValue(10640.924904046242)
+        if compare:
+            self._fir_bypass_checkbox.setChecked(False)
+            self._measure_smith_checkbox.setChecked(False)
+        self._fir_bypass_checkbox.setEnabled(not compare)
+        self._fir_filter_combobox.setEnabled(not compare and not self._fir_bypass_checkbox.isChecked())
+        self._stream_f_enbw_spinbox.setEnabled(not compare and not new_profile)
+        self._measure_smith_checkbox.setEnabled(not compare and not new_profile)
+        self._controller_bandwidths_edit.setEnabled(not compare)
+        self._bandwidths_6k_edit.setEnabled(compare)
+        self._bandwidths_10k_edit.setEnabled(compare)
+        self._update_total_points()
+
+    def _f_mod_array_from_widgets(self):
+        text = self._f_mod_values_edit.text().strip()
+        if text:
+            values = np.asarray(self._parse_positive_list(text, 'FM frequencies'))
+            if np.any((values < 0.1) | (values > 100)):
+                raise ValueError('FM frequencies must be between 0.1 and 100 kHz')
+            return values * 1000.
+        return np.linspace(self._f_mod_min_spinbox.value(),
+                           self._f_mod_max_spinbox.value(),
+                           self._f_mod_points_spinbox.value()) * 1000.
+
     @QtCore.Slot()
     def _update_total_points(self):
         """Update total points display."""
-        total = (self._power_points_spinbox.value() *
-                self._f_mod_points_spinbox.value() *
-                self._f_dev_points_spinbox.value())
-        self._total_points_label.setText(f'Total: {total} measurements')
+        try:
+            f_mod_points = len(self._f_mod_array_from_widgets())
+        except ValueError:
+            self._total_points_label.setText('Invalid exact FM frequency list')
+            return
+        scan_points = (self._power_points_spinbox.value() *
+                       f_mod_points *
+                       self._f_dev_points_spinbox.value())
+        conditions = 1
+        if hasattr(self, '_bandwidths_10k_edit') and self._compare_filters_checkbox.isChecked():
+            try:
+                profiles = self._filter_sweep_from_widgets()
+                conditions = sum(
+                    int(self._measure_open_loop_checkbox.isChecked()) +
+                    (len(p['controller_bandwidths_hz']) if self._measure_conventional_checkbox.isChecked() else 0) +
+                    int(hasattr(self, '_off_resonant_checkbox') and self._off_resonant_checkbox.isChecked())
+                    for p in profiles)
+                self._total_points_label.setText(
+                    f'Total: {scan_points * 2} hyperfine scans; {scan_points * conditions} streams '
+                    '(separate bandwidths per filter)')
+            except ValueError:
+                self._total_points_label.setText('Invalid per-filter bandwidth list')
+            return
+        if hasattr(self, '_measure_open_loop_checkbox'):
+            try:
+                conventional = self._measure_conventional_checkbox.isChecked()
+                smith = self._measure_smith_checkbox.isChecked()
+                bandwidths = (self._parse_positive_list(
+                    self._controller_bandwidths_edit.text(), 'bandwidths')
+                    if conventional or smith else [])
+                gains = (self._parse_positive_list(
+                    self._smith_gain_multipliers_edit.text(), 'Smith gains')
+                    if smith else [])
+                delays = (self._parse_smith_delays(
+                    self._smith_delay_samples_edit.text()) if smith else [])
+                conditions = int(self._measure_open_loop_checkbox.isChecked())
+                if conventional:
+                    conditions += len(bandwidths)
+                if smith:
+                    conditions += len(bandwidths) * len(gains) * len(delays)
+                if (hasattr(self, '_off_resonant_checkbox') and
+                        self._off_resonant_checkbox.isChecked()):
+                    conditions += 1
+            except ValueError:
+                self._total_points_label.setText(
+                    f'Total: {scan_points} hyperfine scans × invalid comparison matrix')
+                return
+        total = scan_points * conditions
+        self._total_points_label.setText(
+            f'Total: {scan_points} hyperfine scans × {conditions} conditions = '
+            f'{total} streams')
 
     # =========================================================================
     # Logic Slots - Updates from Logic
@@ -972,29 +1277,49 @@ class SensitivitySweepGui(GuiBase):
     def _on_point_completed(self, index, result):
         """Handle point completed signal."""
         # Add result to table
+        sorting_enabled = self._results_table.isSortingEnabled()
+        self._results_table.setSortingEnabled(False)
         row = self._results_table.rowCount()
         self._results_table.insertRow(row)
 
         self._results_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(index + 1)))
-        self._results_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f'{result["power_dbm"]:.2f}'))
-        self._results_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f'{result["f_mod_hz"]/1e3:.1f}'))
-        self._results_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f'{result["f_dev_khz"]:.1f}'))
+        self._results_table.setItem(row, 1, QtWidgets.QTableWidgetItem(
+            str(result.get('measurement_mode', 'open_loop'))))
+        self._results_table.setItem(row, 2, QtWidgets.QTableWidgetItem(
+            str(result.get('controller_algorithm', 'disabled'))))
+        bandwidth = result.get('controller_bandwidth_hz')
+        smith_gain = result.get('smith_gain_multiplier')
+        smith_delay = result.get('smith_delay_samples')
+        self._results_table.setItem(row, 3, QtWidgets.QTableWidgetItem(
+            '--' if bandwidth is None else f'{bandwidth:g}'))
+        self._results_table.setItem(row, 4, QtWidgets.QTableWidgetItem(
+            '--' if smith_gain is None else f'{smith_gain:g}'))
+        self._results_table.setItem(row, 5, QtWidgets.QTableWidgetItem(
+            'auto' if (result.get('controller_algorithm') == 'smith_linear' and
+                       smith_delay is None) else
+            '--' if smith_delay is None else str(smith_delay)))
+        self._results_table.setItem(row, 6, QtWidgets.QTableWidgetItem(f'{result["power_dbm"]:.2f}'))
+        self._results_table.setItem(row, 7, QtWidgets.QTableWidgetItem(f'{result["f_mod_hz"]/1e3:.1f}'))
+        self._results_table.setItem(row, 8, QtWidgets.QTableWidgetItem(f'{result["f_dev_khz"]:.1f}'))
 
         linewidth = result.get('linewidth_hz', np.nan)
-        slope = result.get('zc_slope_V_per_Hz', np.nan)
         sensitivity = result.get('sensitivity_nT_rtHz', np.nan)
+        residual = result.get('residual_sensitivity_nT_rtHz', np.nan)
 
-        self._results_table.setItem(row, 4, QtWidgets.QTableWidgetItem(f'{linewidth:.1e}' if not np.isnan(linewidth) else 'N/A'))
-        self._results_table.setItem(row, 5, QtWidgets.QTableWidgetItem(f'{slope:.3e}' if not np.isnan(slope) else 'N/A'))
-        self._results_table.setItem(row, 6, QtWidgets.QTableWidgetItem(f'{sensitivity:.3f}' if not np.isnan(sensitivity) else 'N/A'))
+        self._results_table.setItem(row, 9, QtWidgets.QTableWidgetItem(f'{linewidth:.1e}' if not np.isnan(linewidth) else 'N/A'))
+        self._results_table.setItem(row, 10, QtWidgets.QTableWidgetItem(f'{sensitivity:.3f}' if not np.isnan(sensitivity) else 'N/A'))
+        self._results_table.setItem(row, 11, QtWidgets.QTableWidgetItem(f'{residual:.3f}' if not np.isnan(residual) else 'N/A'))
+        self._results_table.setItem(row, 12, QtWidgets.QTableWidgetItem(
+            str(result.get('fir_filter_bandwidth', '--'))))
 
         # Color code sensitivity (green for good, red for bad)
         if not np.isnan(sensitivity):
-            sens_item = self._results_table.item(row, 6)
+            sens_item = self._results_table.item(row, 10)
             if sensitivity < 20:  # Arbitrary threshold
                 sens_item.setBackground(QtGui.QColor(200, 255, 200))
             elif sensitivity > 50:
                 sens_item.setBackground(QtGui.QColor(255, 200, 200))
+        self._results_table.setSortingEnabled(sorting_enabled)
 
     @QtCore.Slot(dict)
     def _on_sweep_progress(self, progress):
@@ -1009,11 +1334,21 @@ class SensitivitySweepGui(GuiBase):
         self._progress_label.setText(f'Running: {current} / {total} ({percent:.1f}%)')
 
         if not np.isinf(best_sens):
+            controller = best_params.get('controller_algorithm', 'disabled')
+            bandwidth = best_params.get('controller_bandwidth_hz')
+            controller_text = controller
+            if best_params.get('fir_filter_bandwidth'):
+                controller_text += ', ' + best_params['fir_filter_bandwidth']
+            if bandwidth is not None:
+                controller_text += f', {bandwidth:g} Hz'
+            if best_params.get('smith_gain_multiplier') is not None:
+                controller_text += f', x{best_params["smith_gain_multiplier"]:g}'
             self._best_result_label.setText(
                 f'Best sensitivity: {best_sens:.3f} nT/√Hz\n'
                 f'(P={best_params.get("power", 0):.2f}dBm, '
                 f'f_mod={best_params.get("f_mod", 0)/1e3:.1f}kHz, '
-                f'f_dev={best_params.get("f_dev", 0):.1f}kHz)'
+                f'f_dev={best_params.get("f_dev", 0):.1f}kHz; '
+                f'{controller_text})'
             )
 
     @QtCore.Slot()

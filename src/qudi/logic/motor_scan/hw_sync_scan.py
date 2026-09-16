@@ -577,7 +577,10 @@ class HwSyncScanMixin:
         try:
             w = hw.read_stream_words()
             if w is not None and len(w):
-                self._hw_word_chunks.append(np.asarray(w, dtype=np.float64))
+                # Region-11 uses structured timestamped events; the legacy scan
+                # stream uses float words. Preserve whichever representation the
+                # hardware adapter returned.
+                self._hw_word_chunks.append(np.asarray(w))
             xm, ym = hw.read_position_markers()
             if xm is not None and len(xm):
                 self._hw_xmarks_flat = np.concatenate(
@@ -601,6 +604,24 @@ class HwSyncScanMixin:
         if hw is None or not self._hw_word_chunks:
             return None
         words = np.concatenate(self._hw_word_chunks)
+        if words.dtype.names is not None:
+            try:
+                traces = hw.reconstruct_mapped_traces(words)
+            except Exception as e:
+                self.log.warning("KDC_HW_SYNC_MULTIRES reconstruct failed: %s", e)
+                return None
+            if w_lo is None:
+                return traces
+            lo = max(0, int(w_lo))
+            hi = None if w_hi is None else max(lo, int(w_hi))
+            sliced = dict(traces)
+            for key in ('err', 'corr_hz', 'cic'):
+                if key in sliced:
+                    sliced[key] = np.asarray(sliced[key])[:, lo:hi]
+            for key in ('times', 'dead'):
+                if key in sliced:
+                    sliced[key] = np.asarray(sliced[key])[lo:hi]
+            return sliced
         if w_lo is not None:
             width = int(self._hw_multires_words_per_sample)
             a = max(0, width * int(w_lo))
@@ -893,23 +914,23 @@ class HwSyncScanMixin:
                 self.log.warning("Could not configure slow-axis 'In Motion' trigger "
                                  "(line cross-check disabled): %s", e)
 
-        # Start the marker stream. With a streamer owner, route through it so the
-        # board's single stream is cleanly handed over from / restored to the
-        # monitor (time-series / ODMR tracking); otherwise drive the scan directly.
+        # Start a dedicated Region-11 subscription. The scan module no longer owns
+        # continuous transport, so a configured RedPitayaDataInStream is required.
         channel = self._hw_sync_channel_name()
         streamer = self._get_streamer() if getattr(self, '_scan_via_streamer', False) else None
+        if streamer is None:
+            self.log.error(
+                'KDC_HW_SYNC requires the configured Red Pitaya data-stream module; '
+                'scan-local FPGA streaming has been removed.')
+            return False
         try:
-            if streamer is not None:
-                self._scan_module = streamer.begin_scan_stream(input_source=channel)
-            else:
-                scan.mapped_stream_start(input_source=channel)
+            self._scan_module = streamer.begin_scan_stream(input_source=channel)
         except Exception as e:
             self.log.error("Failed to start FPGA marker stream: %s", e)
             return False
 
         self._hw_sync_active = True
-        self.log.info("KDC_HW_SYNC stream started (channel=%s%s).", channel,
-                      ", via redpitaya_stream takeover" if streamer is not None else "")
+        self.log.info("KDC_HW_SYNC Region-11 subscription started (channel=%s).", channel)
 
         self._hw_sync_warmup_sweep()
         return True
@@ -1287,10 +1308,7 @@ class HwSyncScanMixin:
         streamer = self._get_streamer() if getattr(self, '_scan_via_streamer', False) else None
         try:
             if streamer is not None:
-                # Stops the scan stream AND restores the suspended monitor stream.
                 streamer.end_scan_stream()
-            elif scan is not None:
-                scan.mapped_stream_stop()
         except Exception as e:
             self.log.warning("Error stopping FPGA marker stream: %s", e)
         motor = self._motor_hardware()

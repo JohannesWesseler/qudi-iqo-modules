@@ -49,6 +49,7 @@ setup(
     package_dir={'': 'src'},
     package_data={'qudi'    : ['default.cfg'],
                   'qudi.gui': ['*.ui', '*/*.ui'],
+                  'qudi.hardware.battery_tester': ['Testprotokolle/*.json'],
                   },
     description='IQO measurement modules collection for qudi',
     long_description=long_description,
@@ -98,6 +99,19 @@ setup(
                  ],
     license='LGPLv3',
     install_requires=windows_dep if sys.platform == 'win32' else unix_dep,
+    extras_require={
+        'battery-tester': [
+            'python-socketio>=4.6,<5',
+            'python-engineio>=3.13,<4',
+            'websocket-client>=0.54,<2',
+        ],
+        'battery-tester-playwright': [
+            'python-socketio>=4.6,<5',
+            'python-engineio>=3.13,<4',
+            'websocket-client>=0.54,<2',
+            'playwright>=1.40,<2',
+        ],
+    },
     python_requires='>=3.8, <3.11',
     zip_safe=False
 )

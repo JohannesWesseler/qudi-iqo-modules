@@ -115,6 +115,28 @@ class SensitivitySweepVisualizer:
         """
         generated_files = []
 
+        # Avoid averaging different filter responses or controller conditions
+        # together in an automated filter comparison.
+        if 'fir_filter_bandwidth' in self.df and self.df['fir_filter_bandwidth'].nunique() > 1:
+            columns = [name for name in (
+                'fir_filter_bandwidth', 'measurement_mode', 'controller_bandwidth_hz')
+                if name in self.df]
+            for index, (key, frame) in enumerate(self.df.groupby(columns, dropna=False)):
+                label = '_'.join(str(value) for value in (key if isinstance(key, tuple) else (key,)))
+                folder = os.path.join(self.plots_folder, f'{index:03d}_{label}')
+                metadata = self.metadata.copy()
+                valid = frame.dropna(subset=['sensitivity_nT_rtHz'])
+                if not valid.empty:
+                    best = valid.loc[valid['sensitivity_nT_rtHz'].idxmin()]
+                    metadata['best_sensitivity_nT_rtHz'] = float(best['sensitivity_nT_rtHz'])
+                    metadata['best_parameters'] = {
+                        'power': best.get('power_dbm'), 'f_mod': best.get('f_mod_hz'),
+                        'f_dev': best.get('f_dev_khz')}
+                metadata['total_measurements'] = len(frame)
+                child = SensitivitySweepVisualizer(frame, metadata, folder, self.log)
+                generated_files.extend(child.generate_all_plots())
+            return generated_files
+
         if len(self.df) == 0:
             self.log.warning('No data to visualize - results DataFrame is empty')
             return generated_files

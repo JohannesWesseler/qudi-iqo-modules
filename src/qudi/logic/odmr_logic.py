@@ -538,9 +538,20 @@ class OdmrLogic(LogicBase):
 
                 # Set up data acquisition device
                 sampler.set_sample_rate(sample_rate)
+                actual_sample_rate = float(sampler.sample_rate)
+                if not np.isclose(actual_sample_rate, sample_rate):
+                    self.log.warning(
+                        'ODMR scanner adjusted the requested %.3f Hz point rate '
+                        'to %.3f Hz to satisfy hardware acquisition timing.',
+                        sample_rate, actual_sample_rate)
+                # Keep the GUI, saved metadata and line-time estimates consistent
+                # with the rate accepted by the acquisition hardware.
+                self._data_rate = actual_sample_rate / self._oversampling_factor
+                self.sigScanParametersUpdated.emit({'data_rate': self._data_rate})
                 sampler.set_frame_size(samples)
                 # Set up microwave scan and start it
-                microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+                microwave.configure_scan(
+                    self._scan_power, frequencies, mode, actual_sample_rate)
 
                 # "entschärft" eigentlich die Windfreak nur -> Wenn jetzt getriggert wird, springt die WF los
                 microwave.start_scan()

@@ -77,6 +77,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
     _redpitaya_port = ConfigOption('redpitaya_port', default=2222, missing='info')
     # This is not the qudi config, but the pyrpl/Red Pitaya config
     _redpitaya_config_name = ConfigOption('redpitaya_config_name', default='rpy_shared_config', missing='info')
+    _redpitaya_fpga_filename = ConfigOption(
+        'redpitaya_fpga_filename', default=None, missing='info')
 
     # IF configuration
     _if_frequencies = ConfigOption('if_frequencies', missing='error')
@@ -222,7 +224,9 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             # Connect to Red Pitaya
             self._redpitaya = RedPitayaIFSource(self._redpitaya_hostname, self._redpitaya_port)
             # Pass the config name to the connect method
-            self._redpitaya.connect(config_name=self._redpitaya_config_name)
+            self._redpitaya.connect(
+                config_name=self._redpitaya_config_name,
+                fpga_filename=self._redpitaya_fpga_filename)
             self.log.info('Connected to Red Pitaya')
 
             # Sideband selection (must be set before loading calibration files)

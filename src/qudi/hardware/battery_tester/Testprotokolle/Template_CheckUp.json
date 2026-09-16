@@ -1,0 +1,499 @@
+{
+    "version": 2.1,
+    "globals": [
+        {
+            "name": "V_CHARGE1",
+            "value": 4.2,
+            "unit": "V"
+        },
+        {
+            "name": "V_DISCHARGE1",
+            "value": 2.8,
+            "unit": "V"
+        },
+        {
+            "name": "I_CHARGE1",
+            "value": 0.333333,
+            "unit": "CA"
+        },
+        {
+            "name": "I_DISCHARGE1",
+            "value": 0.333333,
+            "unit": "CA"
+        },
+        {
+            "name": "I_CUTOFF_CHARGE",
+            "value": 0.02,
+            "unit": "CA"
+        },
+        {
+            "name": "I_CUTOFF_DISCHARGE",
+            "value": 0.02,
+            "unit": "CA"
+        },
+        {
+            "name": "MEMORY1",
+            "value": 0,
+            "unit": "Ah"
+        }
+    ],
+    "steps": [
+        {
+            "id": 1,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "value": 1,
+                        "unit": "h",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 2,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "value": 1,
+                        "unit": "min",
+                        "action": "NEXT"
+                    },
+                    {
+                        "property": "Temp1",
+                        "operator": "<",
+                        "value": 24,
+                        "unit": "°C",
+                        "action": "GOTO",
+                        "actionParameter": 1
+                    },
+                    {
+                        "property": "Temp1",
+                        "operator": ">",
+                        "value": 26,
+                        "unit": "°C",
+                        "action": "GOTO",
+                        "actionParameter": 1
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 3,
+            "type": "LOOP_START",
+            "repetitions": 5,
+            "steps": [
+                {
+                    "id": 4,
+                    "type": "CHARGE_CCCV",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "I_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "V",
+                                "global": "V_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "I_initial",
+                                "global": "I_CHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "I",
+                                "operator": "<",
+                                "global": "I_CUTOFF_CHARGE",
+                                "value": "100%",
+                                "unit": "",
+                                "delayValue": 100,
+                                "delayUnit": "ms",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 5,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "value": 30,
+                                "unit": "min",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 6,
+                    "type": "DISCHARGE_CCCV",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "I_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "V",
+                                "global": "V_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "I_initial",
+                                "global": "I_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "I",
+                                "operator": "<",
+                                "global": "I_CUTOFF_DISCHARGE",
+                                "value": "100%",
+                                "unit": "",
+                                "delayValue": 100,
+                                "delayUnit": "ms",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 7,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "value": 30,
+                                "unit": "min",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": 8,
+            "type": "LOOP_END"
+        },
+        {
+            "id": 9,
+            "type": "CHARGE_CC",
+            "content": {
+                "parameters": [
+                    {
+                        "property": "I",
+                        "global": "I_CUTOFF_CHARGE",
+                        "value": "100%",
+                        "unit": ""
+                    }
+                ],
+                "endConditions": [
+                    {
+                        "property": "V",
+                        "operator": ">",
+                        "global": "V_CHARGE1",
+                        "value": "100%",
+                        "unit": "",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 20,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 10,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "value": 30,
+                        "unit": "min",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 11,
+            "type": "LOOP_START",
+            "repetitions": 0,
+            "steps": [
+                {
+                    "id": 12,
+                    "type": "DISCHARGE_CCCV",
+                    "content": {
+                        "parameters": [
+                            {
+                                "property": "I",
+                                "global": "I_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "V",
+                                "global": "V_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            },
+                            {
+                                "property": "I_initial",
+                                "global": "I_DISCHARGE1",
+                                "value": "100%",
+                                "unit": ""
+                            }
+                        ],
+                        "endConditions": [
+                            {
+                                "property": "I",
+                                "operator": "<",
+                                "global": "I_CUTOFF_DISCHARGE",
+                                "value": "100%",
+                                "unit": "",
+                                "delayValue": 100,
+                                "delayUnit": "ms",
+                                "action": "EXIT_LOOP"
+                            },
+                            {
+                                "property": "Q_step",
+                                "operator": ">",
+                                "value": 0.02,
+                                "unit": "CN",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 13,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "value": 30,
+                                "unit": "s",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 1,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": 14,
+                    "type": "PAUSE",
+                    "content": {
+                        "parameters": [],
+                        "endConditions": [
+                            {
+                                "property": "t_step",
+                                "operator": ">",
+                                "value": 90,
+                                "unit": "s",
+                                "action": "NEXT"
+                            }
+                        ],
+                        "recordIntervals": [
+                            {
+                                "property": "dt",
+                                "value": 10,
+                                "unit": "s"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "id": 15,
+            "type": "LOOP_END"
+        },
+        {
+            "id": 16,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "value": 30,
+                        "unit": "min",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 17,
+            "type": "CHARGE_CC",
+            "content": {
+                "parameters": [
+                    {
+                        "property": "I",
+                        "global": "I_CHARGE1",
+                        "value": "100%",
+                        "unit": ""
+                    }
+                ],
+                "endConditions": [
+                    {
+                        "property": "V",
+                        "operator": ">",
+                        "global": "V_CHARGE1",
+                        "value": "100%",
+                        "unit": "",
+                        "action": "NEXT"
+                    },
+                    {
+                        "property": "Q_total",
+                        "operator": ">",
+                        "global": "MEMORY1",
+                        "value": "100%",
+                        "unit": "",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 18,
+            "type": "PAUSE",
+            "content": {
+                "parameters": [],
+                "endConditions": [
+                    {
+                        "property": "t_step",
+                        "operator": ">",
+                        "value": 30,
+                        "unit": "min",
+                        "action": "NEXT"
+                    }
+                ],
+                "recordIntervals": [
+                    {
+                        "property": "dt",
+                        "value": 10,
+                        "unit": "s"
+                    }
+                ]
+            }
+        }
+    ]
+}

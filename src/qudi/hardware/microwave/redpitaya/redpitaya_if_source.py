@@ -136,13 +136,15 @@ class RedPitayaIFSource(IFSourceBase):
 
             # Get config name from kwargs, with a reasonable default
             self._config_name = kwargs.get('config_name', 'rp_default_config')
+            fpga_filename = kwargs.get('fpga_filename')
             gui = kwargs.get('gui', True)
 
             # Use the shared factory to get a pyrpl instance
             self.pyrpl, _ = get_pyrpl_instance(
                 hostname=self.hostname,
                 config_name=self._config_name,
-                gui=gui
+                gui=gui,
+                fpga_filename=fpga_filename
             )
             self.logger.info(f"Acquired shared pyrpl instance for {self.hostname} with config '{self._config_name}'")
 
