@@ -189,9 +189,8 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
         default=True,  # Automatically save scan data when scan completes
         missing='info'
     )
-    # KDC_HW_SYNC mode options. The Red Pitaya scan module is obtained via the
-    # shared pyrpl instance (same hostname/config_name the other RP modules use),
-    # NOT a Connector, so it coexists with the streaming / ODMR-lock modules.
+    # Unused since KDC_HW_SYNC reads through the 'streamer' connector; kept so
+    # existing config files that still set them load without errors.
     _redpitaya_hostname = ConfigOption(
         name='redpitaya_hostname',
         default=None,
@@ -825,12 +824,12 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                 # POSITION_ONLY mode requires no measurement connectors
                 self.log.info("POSITION_ONLY mode - stage movement only, no data acquisition")
             elif mode == ScanMode.KDC_HW_SYNC:
-                # Needs the Red Pitaya scan module (shared pyrpl instance) and a
-                # motor driver exposing setup_position_trigger.
+                # Needs the Red Pitaya data stream module ('streamer' connector)
+                # and a motor driver exposing setup_position_trigger.
                 if self._get_scan_module() is None:
-                    self.log.error("Red Pitaya scan module not available. "
-                                   "Cannot perform KDC_HW_SYNC scan (check "
-                                   "redpitaya_hostname / redpitaya_config_name).")
+                    self.log.error("Red Pitaya data stream not available. "
+                                   "Cannot perform KDC_HW_SYNC scan (connect "
+                                   "'streamer' to redpitaya_stream).")
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return

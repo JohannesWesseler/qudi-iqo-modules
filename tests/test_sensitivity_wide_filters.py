@@ -14,6 +14,17 @@ from qudi.gui.sensitivity_sweep.sensitivity_sweep_gui import SensitivitySweepGui
 from qudi.logic.sensitivity_sweep_logic import SensitivitySweepLogic
 from qudi.hardware.redpitaya.redpitaya_odmr_lock import RedPitayaOdmrLockHardware
 from pyrpl.hardware_modules.lock_in import _filter_select_options
+from pyrpl.odmr_instrument import OdmrInstrument
+
+
+def _lock_hw(lockin):
+    """RedPitayaOdmrLockHardware filter methods on a real OdmrInstrument whose
+    lock-in is ``lockin`` (both chains share it)."""
+    rp = SimpleNamespace(lockin=lockin, lockin1=lockin)
+    hw = SimpleNamespace(_odmr=OdmrInstrument(rp), module_name='redpitaya_odmr_lock')
+    for name in ('get_filter_capabilities', 'get_demod_filter', 'set_demod_filter'):
+        setattr(hw, name, MethodType(getattr(RedPitayaOdmrLockHardware, name), hw))
+    return hw
 
 
 class TestWideFilters(unittest.TestCase):
@@ -57,12 +68,12 @@ class TestWideFilters(unittest.TestCase):
                 self.assertNotIn('closed_loop_smith', emitted[0]['tracking_modes'])
 
                 lockin = SimpleNamespace(filter_capabilities={name: True},
-                                         smith_filter_name='2kHz_linear')
-                streamer = SimpleNamespace(_pyrpl=SimpleNamespace(
-                    rp=SimpleNamespace(lockin=lockin)))
+                                         smith_filter_name='2kHz_linear',
+                                         capabilities={}, filter_select_ch1=None,
+                                         fir_bypass_ch1=True)
                 logic = Mock()
                 logic._stream_parameters = emitted[0]
-                logic._time_series_logic.return_value._streamer.return_value = streamer
+                logic._odmr_lock_hw.return_value = _lock_hw(lockin)
                 SensitivitySweepLogic._configure_lock_in_filters(logic)
                 self.assertEqual(lockin.filter_select_ch1, name)
                 self.assertFalse(lockin.fir_bypass_ch1)
@@ -99,13 +110,14 @@ class TestWideFilters(unittest.TestCase):
         logic._sweep_loop_order = ['power', 'f_mod', 'f_dev']
         logic._generate_parameter_combinations = MethodType(
             SensitivitySweepLogic._generate_parameter_combinations, logic)
-        lockin = logic._time_series_logic.return_value._streamer.return_value._pyrpl.rp.lockin
+        logic._filter_capabilities = MethodType(SensitivitySweepLogic._filter_capabilities, logic)
+        lock_hw = logic._odmr_lock_hw.return_value
         sweep = {'power': [-10], 'f_mod': [15260, 20000, 30000], 'f_dev': [100]}
         stream = {'fir_filter_bandwidth': '10kHz_minphase_2048', 'tracking_modes': ['open_loop']}
-        lockin.filter_capabilities = {'10kHz_minphase': True}
+        lock_hw.get_filter_capabilities.return_value = {'10kHz_minphase': True}
         with self.assertRaises(ValueError):
             SensitivitySweepLogic.configure_sweep(logic, sweep, {}, stream)
-        lockin.filter_capabilities = {'10kHz_minphase_2048': True}
+        lock_hw.get_filter_capabilities.return_value = {'10kHz_minphase_2048': True}
         with self.assertRaises(ValueError):
             SensitivitySweepLogic.configure_sweep(
                 logic, sweep, {}, dict(stream, tracking_modes=['closed_loop_smith']))
@@ -114,10 +126,9 @@ class TestWideFilters(unittest.TestCase):
         self.assertAlmostEqual(logic._stream_parameters['f_enbw'], 10640.924904046242)
 
     def test_trace_calibration_follows_live_filter_selection(self):
+        live = ['6kHz_minphase', '10kHz_minphase']
         hw = SimpleNamespace(
-            _pyrpl=SimpleNamespace(rp=SimpleNamespace(
-                lockin=SimpleNamespace(filter_select_ch1='6kHz_minphase'),
-                lockin1=SimpleNamespace(filter_select_ch1='10kHz_minphase'))),
+            _odmr=SimpleNamespace(demod_filter=lambda chain: {'filter': live[chain]}),
             _configured_lock_in_filters=['2kHz_minphase', '2kHz_minphase'],
             _stream_words_per_sample=4, _nslots=2)
         result = RedPitayaOdmrLockHardware.get_trace_calibration(hw)

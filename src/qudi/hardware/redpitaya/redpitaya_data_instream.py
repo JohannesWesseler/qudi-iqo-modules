@@ -139,7 +139,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
         super().__init__(*args, **kwargs)
 
         self._pyrpl = None
-        self._scan_module = None
+        self._odmr = None
         self._data_streamer = None
         self._thread_lock = RecursiveMutex()
 
@@ -192,25 +192,15 @@ class RedPitayaDataInStream(DataInStreamInterface):
             )
             self.log.info(f'Acquired shared pyrpl instance for {self._redpitaya_hostname}')
 
-            # Get scan module (will be used in stream mode)
-            self._scan_module = self._pyrpl.rp.scan
-            self._data_streamer = self._pyrpl.rp.datastreamer
-
-            lock_in = self._pyrpl.rp.lockin
-            lock_caps = lock_in.require_compatible_firmware()
-            stream_caps = self._data_streamer.require_compatible_firmware()
-            self._fpga_clock_freq = int(lock_caps['fpga_clock_hz'])
-            self._demod_decimation = int(lock_caps['sample_period_cycles'])
-            self._stream_sample_rate = float(lock_caps['sample_rate'])
-            if int(stream_caps['timestamp_clock_hz']) != self._fpga_clock_freq:
-                raise RuntimeError(
-                    'Lock-in and data-streamer clock capabilities disagree: '
-                    f'{self._fpga_clock_freq} vs '
-                    f'{stream_caps["timestamp_clock_hz"]} Hz')
+            self._odmr = self._pyrpl.odmr
+            self._data_streamer = self._odmr.streamer
+            firmware = self._odmr.check_firmware()
+            self._fpga_clock_freq = int(firmware['fpga_clock_hz'])
+            self._demod_decimation = int(firmware['sample_period_cycles'])
+            self._stream_sample_rate = float(firmware['sample_rate'])
 
             # Set initial stream input mode from config
             self._current_stream_input = self._stream_input
-            self._scan_module.input_select = self._current_stream_input
             self.log.info(f'Stream input configured: {self._current_stream_input}')
 
             # Configure lock-in filter settings when using demod input
@@ -268,6 +258,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
                     config_name=self._redpitaya_config_name
                 )
                 self._pyrpl = None
+                self._odmr = None
 
             self.log.info('Red Pitaya data instream module deactivated')
 
@@ -281,36 +272,17 @@ class RedPitayaDataInStream(DataInStreamInterface):
         Called automatically during activation when stream_input='demod'.
         """
         try:
-            # Module is named 'lockin' (not 'lock_in') per PyRPL naming convention
-            lock_in = self._pyrpl.rp.lockin
-
-            # Configure FIR bypass (True = CIC only, ~15 kHz BW, ~160 µs latency)
-            lock_in.fir_bypass_ch1 = self._lock_in_fir_bypass_ch1
-            lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
-
-            # Derive selections from the loaded FPGA profile. This prevents an
-            # invalid config from falling back to a FIR that was compiled out of
-            # the resource-reduced fast image.
-            valid_filters = {
-                name for name, available in lock_in.filter_capabilities.items()
-                if available and name != 'fir_bypass'}
-            if '2kHz_minphase' in valid_filters:
-                valid_filters.add('2kHz')  # legacy alias
-            fallback_filter = ('2kHz_minphase'
-                               if '2kHz_minphase' in valid_filters
-                               else next(iter(sorted(valid_filters))))
-
-            if self._lock_in_filter_ch1 not in valid_filters:
-                self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
-                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
-                self._lock_in_filter_ch1 = fallback_filter
-            lock_in.filter_select_ch1 = self._lock_in_filter_ch1
-
-            if self._lock_in_filter_ch2 not in valid_filters:
-                self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
-                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
-                self._lock_in_filter_ch2 = fallback_filter
-            lock_in.filter_select_ch2 = self._lock_in_filter_ch2
+            # Resonance-1 lock-in (chain 0), per channel as configured. The
+            # instrument validates the names against the loaded image and logs
+            # if another module configured a different filter.
+            odmr = self._odmr
+            self._lock_in_filter_ch1 = odmr.set_demod_filter(
+                self._lock_in_filter_ch1, bypass=self._lock_in_fir_bypass_ch1,
+                chains=(0,), channels=(1,), owner=self.module_name)[0]['filter']
+            odmr.set_demod_filter(
+                self._lock_in_filter_ch2, bypass=self._lock_in_fir_bypass_ch2,
+                chains=(0,), channels=(2,))
+            self._lock_in_filter_ch2 = odmr.lockin(0).filter_select_ch2
 
             # Log configuration summary
             ch1_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch1 else f'CIC+FIR ({self._lock_in_filter_ch1})'
@@ -370,9 +342,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
         """
         Set streaming input source.
 
-        Can be called while streaming is active or inactive. The FPGA register is
-        always updated immediately to ensure the correct input is selected for
-        subsequent operations (including ODMR scans that share the scan module).
+        Can be called while streaming is active or inactive. Only this module's
+        Region-11 subscription changes; finite ODMR sweeps select their own
+        accumulator input.
 
         Args:
             input_mode: 'demod' for error signal or 'ftw_corr' for frequency correction
@@ -386,22 +358,15 @@ class RedPitayaDataInStream(DataInStreamInterface):
 
             self._current_stream_input = input_mode
 
-            # Always update FPGA register immediately, regardless of streaming state.
-            # This is critical because other modules (e.g., RedPitayaFiniteSamplingInput
-            # for ODMR scans) share the same physical scan module and need the correct
-            # input_select setting.
-            # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
-            if self._scan_module is not None:
-                self._scan_module.input_select = input_mode
-                if self._running:
-                    if not self._scan_active and self._data_streamer is not None:
-                        source = 'fir' if input_mode == 'demod' else 'correction'
-                        self._data_streamer.update_subscription(self._rx, (source,))
-                        # The reader starts a new sample grid for the new source.
-                        self._last_gap_reported = 0
-                    self.log.info(f'Stream input switched live to: {input_mode}')
-                else:
-                    self.log.info(f'Stream input set to: {input_mode} (FPGA register updated)')
+            if self._running:
+                if not self._scan_active and self._data_streamer is not None:
+                    source = 'fir' if input_mode == 'demod' else 'correction'
+                    self._data_streamer.update_subscription(self._rx, (source,))
+                    # The reader starts a new sample grid for the new source.
+                    self._last_gap_reported = 0
+                self.log.info(f'Stream input switched live to: {input_mode}')
+            else:
+                self.log.info(f'Stream input set to: {input_mode}')
 
     def configure(self,
                   active_channels: Sequence[str],
@@ -558,10 +523,6 @@ class RedPitayaDataInStream(DataInStreamInterface):
     # monitor. The FPGA frequency lock is unaffected throughout (it runs in
     # hardware and does not depend on the stream).
 
-    def get_scan_module(self):
-        """Return the shared pyrpl scan module (for marker register reads etc.)."""
-        return self._scan_module
-
     @property
     def scan_active(self) -> bool:
         """True while a KDC_HW_SYNC scan owns the stream (monitor reads via a tap)."""
@@ -634,7 +595,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
         return self._new_scan_markers('y_position')
 
     def ftw_to_hz(self, values):
-        return self._scan_module.ftw_to_hz(values)
+        return self._odmr.ftw_to_hz(values)
 
     def _drain_rx(self):
         """Pull all samples the receiver has buffered, calibrate them, and append
@@ -662,7 +623,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
             # NaN gap markers propagate cleanly through both paths.
             if self._current_stream_input == 'ftw_corr':
                 # FTW correction: convert to Hz using pyrpl's conversion
-                calibrated_data = self._scan_module.ftw_to_hz(raw_data) * self._signal_scale
+                calibrated_data = self._odmr.ftw_to_hz(raw_data) * self._signal_scale
             else:
                 # Demod: apply calibration factor
                 calibrated_data = raw_data * self._calibration_factor * self._signal_scale

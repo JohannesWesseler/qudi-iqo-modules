@@ -331,16 +331,14 @@ class HwSyncScanMixin:
       * ``_release_scan_module()`` - on module deactivate.
 
     Requires the parent (``MotorScanLogic``) to provide ``_motor_hardware()``,
-    ``_scan_data``, ``log``, and the ConfigOptions ``redpitaya_hostname`` /
-    ``redpitaya_config_name`` (matching the other Red Pitaya modules so the pyrpl
-    instance is shared) plus optional ``hw_sync_*`` tuning options.
+    ``_scan_data``, ``log``, the ``streamer`` connector to the Red Pitaya data
+    stream module (``redpitaya_stream``) and optional ``hw_sync_*`` tuning options.
     """
 
     def _init_hw_sync_state(self):
         """Initialize HW-sync buffers/handles. Call from ``__init__``."""
-        self._scan_module = None
-        self._pyrpl = None
-        self._scan_via_streamer = False     # True if scan module came from redpitaya_stream
+        self._scan_module = None            # redpitaya_stream while a scan stream runs
+        self._scan_via_streamer = False
         # Multi-resonance (KDC_HW_SYNC_MULTIRES) state: the tracker owns the stream,
         # we drain raw triplet WORDS (reconstructed on the PC into 2N fresh-only
         # traces) instead of a single demod array.
@@ -406,12 +404,10 @@ class HwSyncScanMixin:
         be enough to be moving steadily across the throwaway + first boundary."""
         return float(getattr(self, '_hw_sync_runup', 0.5e-3))
 
-    # ---- pyrpl scan-module acquisition (shared-instance, refcounted) -----------
+    # ---- Red Pitaya data stream ------------------------------------------------
     def _get_streamer(self):
-        """Return the connected Red Pitaya stream owner (``redpitaya_stream``) or
-        None. When present it owns the board's single push stream and arbitrates
-        the KDC_HW_SYNC takeover; when absent we drive the pyrpl scan module
-        directly (headless tests)."""
+        """Return the connected Red Pitaya stream module (``redpitaya_stream``) or
+        None. It provides the motor-scan subscription (``begin_scan_stream``)."""
         conn = getattr(self, '_streamer', None)
         if conn is None:
             return None
@@ -421,57 +417,26 @@ class HwSyncScanMixin:
             return None
 
     def _get_scan_module(self):
-        """Return the pyrpl ``Scan`` module. Prefers the shared ``redpitaya_stream``
-        owner's scan module (so the board's single stream is coordinated, not
-        duplicated); falls back to acquiring the shared pyrpl instance directly.
-        Caches on ``self._scan_module``."""
+        """Return the Red Pitaya stream module that serves the scan stream.
+
+        The motor scan needs no direct FPGA access: samples and position markers
+        come from a ``redpitaya_stream`` subscription (``begin_scan_stream``).
+        Returns None (and logs) when the ``streamer`` connector is missing.
+        """
         if getattr(self, '_scan_module', None) is not None:
             return self._scan_module
         streamer = self._get_streamer()
-        if streamer is not None:
-            try:
-                sm = streamer.get_scan_module()
-            except Exception as e:
-                sm = None
-                self.log.warning("redpitaya_stream.get_scan_module() failed: %s", e)
-            if sm is not None:
-                self._scan_module = sm
-                self._scan_via_streamer = True
-                return sm
-        host = getattr(self, '_redpitaya_hostname', None)
-        cfg = getattr(self, '_redpitaya_config_name', None)
-        if not host:
-            self.log.error("KDC_HW_SYNC needs a 'streamer' connector OR the "
-                           "'redpitaya_hostname'/'redpitaya_config_name' ConfigOptions.")
+        if streamer is None:
+            self.log.error("KDC_HW_SYNC needs the 'streamer' connector to the Red "
+                           "Pitaya data stream module.")
             return None
-        try:
-            from qudi.hardware.redpitaya.resource_manager import get_pyrpl_instance
-            self._pyrpl, _ = get_pyrpl_instance(hostname=host, config_name=cfg)
-            self._scan_module = self._pyrpl.rp.scan
-            self._scan_via_streamer = False
-            return self._scan_module
-        except Exception as e:
-            self.log.error("Failed to acquire pyrpl scan module: %s", e)
-            return None
+        self._scan_module = streamer
+        self._scan_via_streamer = True
+        return streamer
 
     def _release_scan_module(self):
-        """Release our reference to the shared pyrpl instance (call on deactivate).
-        No-op for the streamer path -- the ``redpitaya_stream`` module owns that
-        instance and releases it itself."""
-        if getattr(self, '_scan_module', None) is None:
-            return
-        if getattr(self, '_scan_via_streamer', False):
-            self._scan_module = None
-            return
-        host = getattr(self, '_redpitaya_hostname', None)
-        cfg = getattr(self, '_redpitaya_config_name', None)
-        try:
-            from qudi.hardware.redpitaya.resource_manager import release_pyrpl_instance
-            release_pyrpl_instance(hostname=host, config_name=cfg)
-        except Exception as e:
-            self.log.warning("Failed to release pyrpl instance: %s", e)
+        """Forget the stream module reference (call on deactivate)."""
         self._scan_module = None
-        self._pyrpl = None
 
     # ---- multi-resonance (KDC_HW_SYNC_MULTIRES) data path -----------------------
     # The multi-resonance tracker (redpitaya_odmr_lock, MultiResonanceTrackingInterface)

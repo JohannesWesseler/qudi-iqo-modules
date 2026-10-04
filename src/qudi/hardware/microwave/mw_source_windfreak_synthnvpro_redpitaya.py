@@ -987,12 +987,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             # Toggle lock-in demodulation bypass based on FM enable state.
             # When FM is disabled, we use DC ODMR mode (bypass demodulation).
             # When FM is enabled, we need lock-in demodulation (disable bypass).
-            if enable is not None and self._redpitaya and self._redpitaya.pyrpl:
+            if enable is not None and self._redpitaya and self._redpitaya.odmr:
                 try:
-                    lockin = self._redpitaya.pyrpl.rp.lockin
                     bypass = not self._enable_fm
-                    lockin.demod_bypass_ch1 = bypass
-                    lockin.demod_bypass_ch2 = bypass
+                    self._redpitaya.odmr.set_demod_bypass(bypass, owner=self.module_name)
                     self.log.info(f'Lock-in demod bypass set to {bypass} '
                                   f'(DC ODMR mode {"enabled" if bypass else "disabled"})')
                 except Exception as e:

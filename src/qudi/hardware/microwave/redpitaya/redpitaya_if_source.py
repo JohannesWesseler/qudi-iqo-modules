@@ -101,7 +101,8 @@ Implementation Notes:
 3. Each frequency component can be independently enabled/disabled
 4. Phase accumulator is 32-bit for high frequency resolution
 5. Calibration data is cached after loading for efficiency
-6. FM modulation frequency is controlled via iq0 module
+6. FM modulation frequency, demodulation reference and output routing are set
+   through the pyrpl ODMR instrument layer (``pyrpl.odmr_instrument``)
 
 """
 
@@ -123,6 +124,7 @@ class RedPitayaIFSource(IFSourceBase):
         self.hostname = hostname
         self.port = port
         self.pyrpl = None
+        self.odmr = None
         self.fgen3 = None
         self._config_name = None
         self._current_config = None
@@ -148,13 +150,9 @@ class RedPitayaIFSource(IFSourceBase):
             )
             self.logger.info(f"Acquired shared pyrpl instance for {self.hostname} with config '{self._config_name}'")
 
-            # Initialize fgen3 module
-            self.fgen3 = self.pyrpl.rp.fgen3
-
-            # Configure signal routing
-            self.fgen3.output_to_dsp_enable_o = True
-            self.pyrpl.rp.asg0.output_direct = "out1"
-            self.pyrpl.rp.asg1.output_direct = "out2"
+            self.odmr = self.pyrpl.odmr
+            self.fgen3 = self.odmr.synth
+            self.odmr.route_if_outputs()
 
             self._is_connected = True
             self.logger.info("Red Pitaya connected successfully")
@@ -167,8 +165,7 @@ class RedPitayaIFSource(IFSourceBase):
         """Disconnect from the Red Pitaya."""
         try:
             if self.fgen3:
-                self.fgen3.gen_enable = False
-                self.fgen3.output_zero = True
+                self.odmr.set_if_output(False)
                 # Disable all components and their FM
                 for i in range(self._max_components):
                     setattr(self.fgen3, f'enable{i}', False)
@@ -183,6 +180,7 @@ class RedPitayaIFSource(IFSourceBase):
                     config_name=self._config_name
                 )
                 self.pyrpl = None
+                self.odmr = None
                 self._config_name = None
 
             self._is_connected = False
@@ -354,7 +352,10 @@ class RedPitayaIFSource(IFSourceBase):
 
     def set_fm_modulation_frequency(self, frequency: float, phase_offset: float = None) -> None:
         """
-        Set the FM modulation frequency via iq0 module.
+        Set the FM modulation frequency (iq0 reference oscillator).
+
+        Both lock-in chains are switched to the phase-shifted reference, and the
+        reference square wave is put on DIO1_P for an external lock-in.
 
         Parameters:
         -----------
@@ -368,25 +369,13 @@ class RedPitayaIFSource(IFSourceBase):
             raise RuntimeError("Red Pitaya not connected")
 
         try:
-            # Set the frequency on iq0 module which controls FM modulation
-            self.pyrpl.rp.iq0.frequency = frequency
-            self.pyrpl.rp.iq0.input = "in1"
-            self.pyrpl.rp.iq0.bandwidth = [500, 500]
-            self.pyrpl.rp.iq0.output_signal = "quadrature"
-            self.pyrpl.rp.iq0.quadrature_factor = 1.0
-
-            # Set phase offset if specified
+            self.odmr.set_fm_frequency(frequency)
             if phase_offset is not None:
-                self.pyrpl.rp.iq0.phase = phase_offset
-                self.logger.info(f"IQ0 phase offset set to {phase_offset:.2f} degrees")
-
-            self.pyrpl.rp.lockin.ref_select1 = "sin_shifted"
-            self.pyrpl.rp.lockin.ref_select2 = "cos_shifted"
-            self.logger.warning(f"IQ Reference Info: {self.pyrpl.rp.lockin.get_iq_reference_info(channel=1)}")
-            #self.pyrpl.rp.iq0.gain = 1.0
-            #self.pyrpl.rp.iq0.output_direct = "off"
-
-            self.pyrpl.rp.hk.configure_pin("P1", direction="output", source="module") # reference pin for external lock-in amplifier
+                self.odmr.set_demod_phase(phase_offset)
+                self.logger.info(f"Demodulation phase set to {phase_offset:.2f} degrees")
+            self.odmr.use_demod_phase_reference()
+            self.logger.debug(f"Lock-in references: {self.odmr.reference_selection()}")
+            self.odmr.enable_reference_output()
             self.logger.info(f"FM modulation frequency set to {frequency / 1e3:.3f} kHz")
 
             # Update current config if it exists
@@ -399,7 +388,7 @@ class RedPitayaIFSource(IFSourceBase):
 
     def set_iq_phase_offset(self, phase_offset: float) -> None:
         """
-        Set the IQ demodulation phase offset (iq0.phase).
+        Set the demodulation phase offset of the reference (iq0.phase).
 
         Parameters:
         -----------
@@ -410,8 +399,8 @@ class RedPitayaIFSource(IFSourceBase):
             raise RuntimeError("Red Pitaya not connected")
 
         try:
-            self.pyrpl.rp.iq0.phase = phase_offset
-            self.logger.info(f"IQ0 phase offset set to {phase_offset:.2f} degrees")
+            self.odmr.set_demod_phase(phase_offset)
+            self.logger.info(f"Demodulation phase set to {phase_offset:.2f} degrees")
 
             # Update current config if it exists
             if self._current_config:
@@ -432,8 +421,7 @@ class RedPitayaIFSource(IFSourceBase):
         self.logger.debug(f"Configuring signal with {config.num_components} components")
 
         # First, ensure the generator is properly initialized
-        self.fgen3.gen_enable = True
-        self.fgen3.output_zero = False
+        self.odmr.set_if_output(True)
 
         # Disable all components first
         for i in range(self._max_components):
@@ -496,8 +484,7 @@ class RedPitayaIFSource(IFSourceBase):
         if not self._is_connected:
             raise RuntimeError("Red Pitaya not connected")
 
-        self.fgen3.gen_enable = enable
-        self.fgen3.output_zero = not enable
+        self.odmr.set_if_output(enable)
         self.logger.debug(f"Output {'enabled' if enable else 'disabled'}")
 
     def set_dc_offsets(self, i_offset: float, q_offset: float) -> None:
@@ -600,11 +587,10 @@ class RedPitayaIFSource(IFSourceBase):
                         fm_deviation_khz=getattr(self.fgen3, f'fm_deviation_khz{i}', 0)
                     ))
 
-            # Try to read FM modulation frequency from iq0
             fm_mod_freq = None
             try:
-                fm_mod_freq = self.pyrpl.rp.iq0.frequency
-            except:
+                fm_mod_freq = self.odmr.fm_frequency
+            except Exception:
                 pass
 
             self._current_config = IQDeviceConfig(
@@ -621,11 +607,10 @@ class RedPitayaIFSource(IFSourceBase):
         if not self._is_connected:
             raise RuntimeError("Red Pitaya not connected")
 
-        # Get FM modulation frequency
         fm_mod_freq = None
         try:
-            fm_mod_freq = self.pyrpl.rp.iq0.frequency
-        except:
+            fm_mod_freq = self.odmr.fm_frequency
+        except Exception:
             pass
 
         status = {

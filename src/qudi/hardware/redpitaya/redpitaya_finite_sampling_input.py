@@ -116,6 +116,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
         super().__init__(*args, **kwargs)
 
         self._pyrpl = None
+        self._odmr = None
         self._scan_module = None
 
         self._thread_lock = RecursiveMutex()
@@ -143,17 +144,15 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             )
             self.log.info(f'Acquired shared pyrpl instance for {self._redpitaya_hostname}')
 
-            # Get the scan module
-            self._scan_module = self._pyrpl.rp.scan
-            self._hk_module   = self._pyrpl.rp.hk
-            lock_caps = self._pyrpl.rp.lockin.require_compatible_firmware()
-            self._fpga_clock_hz = int(lock_caps['fpga_clock_hz'])
-            self._demod_sample_period_cycles = int(
-                lock_caps['sample_period_cycles'])
+            self._odmr = self._pyrpl.odmr
+            self._scan_module = self._odmr.sequencer
+            firmware = self._odmr.check_firmware()
+            self._fpga_clock_hz = int(firmware['fpga_clock_hz'])
+            self._demod_sample_period_cycles = int(firmware['sample_period_cycles'])
             self._minimum_demod_samples_per_point = max(
                 1, int(self._minimum_demod_samples_per_point))
 
-            self._hk_module.configure_pin('P7', direction='output', source='module', invert=True)
+            self._odmr.configure_trigger_output()
             self.log.info("Configured trigger pin P7 (DIO7_P) as an inverted module output.")
 
             # Configure scan module defaults
@@ -204,6 +203,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
                 if self.module_state() == 'locked':
                     self._scan_module.stop()
                     self._scan_module.reset()
+                self._odmr.release_sequencer(self.module_name)
 
             if self._pyrpl is not None:
                 # Release the instance, letting the shared manager handle cleanup
@@ -212,6 +212,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
                     config_name=self._redpitaya_config_name
                 )
                 self._pyrpl = None
+                self._odmr = None
 
         except Exception as e:
             self.log.error(f'Error during deactivation: {e}')
@@ -298,10 +299,14 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
         assert self.module_state() == 'idle', \
             'Acquisition already in progress'
 
+        # Fails if multi-resonance hopping currently drives the sequencer.
+        self._odmr.claim_sequencer(self.module_name)
         self.module_state.lock()
 
         try:
-            # Configure scan module
+            # Configure scan module. The accumulator input belongs to this
+            # module; set it for every sweep.
+            self._scan_module.input_select = self._input_select
             self._scan_module.num_steps = self._frame_size
 
             trigger_time = self._trigger_output_duration
@@ -347,6 +352,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
 
         except Exception as e:
             self.module_state.unlock()
+            self._odmr.release_sequencer(self.module_name)
             raise RuntimeError(f'Failed to start acquisition: {e}')
 
     def stop_buffered_acquisition(self):
@@ -368,6 +374,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
 
             finally:
                 self.module_state.unlock()
+                self._odmr.release_sequencer(self.module_name)
 
     def get_buffered_samples(self, number_of_samples=None):
         """Get samples from buffer."""
@@ -453,6 +460,11 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
                 return
 
             try:
+                self._odmr.claim_sequencer(self.module_name)
+            except Exception as e:
+                self.log.error(f'Cannot generate pulse: {e}')
+                return
+            try:
                 # Configure scan for single pulse
                 self._scan_module.num_steps = 1
                 self._scan_module.trigger_length = duration
@@ -471,6 +483,8 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
 
             except Exception as e:
                 self.log.error(f'Failed to generate pulse: {e}')
+            finally:
+                self._odmr.release_sequencer(self.module_name)
 
     def _configure_lock_in_filters(self):
         """Configure lock-in module filter settings from config options.
@@ -479,39 +493,23 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
         Called automatically during activation when input_select='demod'.
         """
         try:
-            # Module is named 'lockin' (not 'lock_in') per PyRPL naming convention
-            lock_in = self._pyrpl.rp.lockin
+            # Resonance-1 lock-in (chain 0), per channel as configured. The
+            # instrument validates the names against the loaded image and logs
+            # if another module configured a different filter.
+            odmr = self._odmr
+            self._lock_in_filter_ch1 = odmr.set_demod_filter(
+                self._lock_in_filter_ch1, bypass=self._lock_in_fir_bypass_ch1,
+                chains=(0,), channels=(1,), owner=self.module_name)[0]['filter']
+            odmr.set_demod_filter(
+                self._lock_in_filter_ch2, bypass=self._lock_in_fir_bypass_ch2,
+                chains=(0,), channels=(2,))
+            self._lock_in_filter_ch2 = odmr.lockin(0).filter_select_ch2
 
-            # Configure FIR bypass (True = CIC only, ~15 kHz BW, ~160 µs latency)
-            lock_in.fir_bypass_ch1 = self._lock_in_fir_bypass_ch1
-            lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
-
-            # Derive selections from the loaded FPGA profile so an invalid
-            # setting cannot fall back to a FIR absent from the fast image.
-            valid_filters = {
-                name for name, available in lock_in.filter_capabilities.items()
-                if available and name != 'fir_bypass'}
-            if '2kHz_minphase' in valid_filters:
-                valid_filters.add('2kHz')  # legacy alias
-            fallback_filter = ('2kHz_minphase'
-                               if '2kHz_minphase' in valid_filters
-                               else next(iter(sorted(valid_filters))))
-
-            if self._lock_in_filter_ch1 not in valid_filters:
-                self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
-                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
-                self._lock_in_filter_ch1 = fallback_filter
-            lock_in.filter_select_ch1 = self._lock_in_filter_ch1
-
-            if self._lock_in_filter_ch2 not in valid_filters:
-                self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
-                                 f'Using "{fallback_filter}". Valid options: {valid_filters}')
-                self._lock_in_filter_ch2 = fallback_filter
-            lock_in.filter_select_ch2 = self._lock_in_filter_ch2
-
-            # Configure demodulation bypass (DC ODMR mode)
-            lock_in.demod_bypass_ch1 = self._lock_in_demod_bypass_ch1
-            lock_in.demod_bypass_ch2 = self._lock_in_demod_bypass_ch2
+            # Demodulation bypass (DC ODMR mode)
+            odmr.set_demod_bypass(self._lock_in_demod_bypass_ch1, chains=(0,),
+                                  channels=(1,), owner=self.module_name)
+            odmr.set_demod_bypass(self._lock_in_demod_bypass_ch2, chains=(0,),
+                                  channels=(2,))
 
             # Log configuration summary
             ch1_demod = 'DC bypass' if self._lock_in_demod_bypass_ch1 else 'lock-in demod'

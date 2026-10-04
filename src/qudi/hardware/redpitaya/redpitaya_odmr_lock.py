@@ -85,6 +85,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pyrpl = None
+        self._odmr = None
         self._lock = None
         self._multitrack = None
         self._fgen3 = None
@@ -143,34 +144,18 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         # Runtime high-rate display window (words), seeded from the ConfigOption.
         self._trace_window_words = max(4, int(self._max_trace_samples))
 
-        rp = self._pyrpl.rp
-        # Get odmrfreqlock module (PyRPL naming: all lowercase, no underscores)
-        self._lock = rp.odmrfreqlock
-        # Multi-resonance hardware surface (may be absent on an old bitstream)
-        self._multitrack = getattr(rp, 'odmrmultitrack', None)
-        self._fgen3 = getattr(rp, 'fgen3', None)
-        self._scan = getattr(rp, 'scan', None)
-        self._streamer = getattr(rp, 'datastreamer', None)
-        if self._streamer is None:
-            raise RuntimeError(
-                'rp.datastreamer is required; load the matching experiment FPGA image')
-
-        lock0 = rp.lockin
-        lock1 = rp.lockin1
-        lock0_caps = lock0.require_compatible_firmware()
-        lock1_caps = lock1.require_compatible_firmware()
-        tracker_caps = self._lock.require_compatible_firmware()
-        stream_caps = self._streamer.require_compatible_firmware()
-        timing = {(int(c['fpga_clock_hz']), int(c['sample_period_cycles']))
-                  for c in (lock0_caps, lock1_caps, tracker_caps)}
-        if len(timing) != 1:
-            raise RuntimeError(
-                'Lock-in/tracker timing capabilities disagree: %r' % sorted(timing))
-        self._fpga_clock_hz, self._sample_period_cycles = timing.pop()
-        if int(stream_caps['timestamp_clock_hz']) != self._fpga_clock_hz:
-            raise RuntimeError('Tracker and data-streamer timestamp clocks disagree')
-        self._stream_sample_rate_hz = (
-            float(self._fpga_clock_hz) / self._sample_period_cycles)
+        # Cross-module settings go through the shared ODMR instrument layer.
+        self._odmr = self._pyrpl.odmr
+        self._lock = self._odmr.lock
+        self._multitrack = self._odmr.oscillator
+        self._fgen3 = self._odmr.synth
+        self._scan = self._odmr.sequencer
+        self._streamer = self._odmr.streamer
+        firmware = self._odmr.check_firmware()
+        tracker_caps = firmware['tracker']
+        self._fpga_clock_hz = int(firmware['fpga_clock_hz'])
+        self._sample_period_cycles = int(firmware['sample_period_cycles'])
+        self._stream_sample_rate_hz = float(firmware['sample_rate'])
         if self._tracking_algorithm not in ('conventional', 'smith_linear'):
             raise ValueError(
                 f'Invalid tracking_algorithm {self._tracking_algorithm!r}; '
@@ -184,7 +169,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
         # Multitrack routes resonance 1 through lockin channel 1 and resonance 2
         # through lockin1 channel 1. Configure both instances explicitly.
-        self._configure_lock_in_filters(rp)
+        self._configure_lock_in_filters()
 
         # Ensure lock + oscillator are disabled on activation
         self._lock.enable = False
@@ -195,17 +180,18 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             except Exception as e:
                 self.log.warning(f'Could not disable multitrack oscillator on activation: {e}')
 
-        if self._multitrack is None:
-            self.log.warning('rp.odmrmultitrack not found - multi-resonance tracking '
-                             'unavailable (old bitstream?). Single-resonance lock still works.')
         self.log.info(
             'Red Pitaya ODMR Lock connected: %s; rate=%.6f Hz, period=%d clocks, '
             'algorithm=%d', self._redpitaya_hostname, self._stream_sample_rate_hz,
             self._sample_period_cycles, int(tracker_caps['algorithm_id']))
 
-    def _configure_lock_in_filters(self, rp) -> None:
-        """Apply the per-resonance FIR phase selection to both lock-in instances."""
-        modeled_filter = rp.lockin.smith_filter_name
+    def _configure_lock_in_filters(self) -> None:
+        """Apply the per-resonance FIR selection to both lock-in chains.
+
+        Channel 1 is the multitrack data path; channel 2 is kept in step so it
+        is ready if the quadrature lane is used later.
+        """
+        modeled_filter = self._odmr.lockin(0).smith_filter_name
         requested = [self._lock_in_filter_resonance_1,
                      self._lock_in_filter_resonance_2]
         if self._tracking_algorithm == 'smith_linear':
@@ -215,36 +201,13 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                     modeled_filter)
             requested[0] = modeled_filter
 
-        for index, (module_name, filter_name) in enumerate(
-                zip(('lockin', 'lockin1'), requested), start=1):
-            lock_in = getattr(rp, module_name, None)
-            if lock_in is None:
-                self.log.warning(
-                    f'rp.{module_name} not found; cannot configure resonance {index} FIR')
-                continue
-
-            valid_filters = {
-                name for name, available in lock_in.filter_capabilities.items()
-                if available and name != 'fir_bypass'}
-            if '2kHz_minphase' in valid_filters:
-                valid_filters.add('2kHz')  # legacy alias
-            fallback_filter = ('2kHz_minphase'
-                               if '2kHz_minphase' in valid_filters
-                               else next(iter(sorted(valid_filters))))
-
-            # Channel 1 is the current multitrack data path. Keep channel 2 in
-            # step so it is ready if the unused quadrature lane is enabled later.
-            if filter_name not in valid_filters:
-                self.log.warning(
-                    f'FIR "{filter_name}" is not available in the loaded FPGA '
-                    f'profile; using "{fallback_filter}"')
-                filter_name = fallback_filter
-            lock_in.filter_select_ch1 = filter_name
-            lock_in.filter_select_ch2 = filter_name
-            self._configured_lock_in_filters[index - 1] = (
-                '2kHz_minphase' if filter_name == '2kHz' else filter_name)
-            self.log.info(
-                f'Resonance {index} FIR ({module_name}): {filter_name}')
+        for chain, filter_name in enumerate(requested):
+            state = self._odmr.set_demod_filter(
+                filter_name, chains=(chain,), channels=(1, 2),
+                owner=self.module_name)[0]
+            self._configured_lock_in_filters[chain] = (
+                '2kHz_minphase' if state['filter'] == '2kHz' else state['filter'])
+            self.log.info(f'Resonance {chain + 1} FIR (chain {chain}): {state["filter"]}')
 
     def get_trace_calibration(self) -> Dict[str, Any]:
         """Return the fixed-point scaling needed to calibrate the CIC trace.
@@ -255,10 +218,9 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         """
         # Sensitivity sweeps can change the shared FIR after activation.
         # Report the current hardware choice, not the initial config file.
-        if self._pyrpl is not None:
+        if self._odmr is not None:
             self._configured_lock_in_filters = [
-                getattr(self._pyrpl.rp, module).filter_select_ch1
-                for module in ('lockin', 'lockin1')]
+                self._odmr.demod_filter(chain)['filter'] for chain in (0, 1)]
         minphase_gain = 937716.0 / (2 ** 21)
         linear_gain = (802861.0 / (2 ** 21)) * (299.0 / 256.0)
         fast_linear_gain = 200955.0 / (2 ** 21)
@@ -292,12 +254,15 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 self.log.warning(f'Could not disable multitrack on deactivation: {e}')
 
         # Release pyrpl instance
+        if self._odmr is not None:
+            self._odmr.release_sequencer(self.module_name)
         if self._pyrpl is not None:
             release_pyrpl_instance(
                 hostname=self._redpitaya_hostname,
                 config_name=self._redpitaya_config_name
             )
             self._pyrpl = None
+            self._odmr = None
 
         self._lock = None
         self.log.info('Red Pitaya ODMR Lock deactivated')
@@ -327,11 +292,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             # Other shared Qudi hardware modules can select the FIR during scans or
             # activation. Reassert the modeled path immediately before configuring
             # the controller, then let the FPGA compatibility input verify it.
-            lock_in = self._pyrpl.rp.lockin
-            lock_in.fir_bypass_ch1 = False
-            lock_in.demod_bypass_ch1 = False
-            modeled_filter = lock_in.smith_filter_name
-            lock_in.filter_select_ch1 = modeled_filter
+            modeled_filter = self._assert_smith_filter()
             self.set_integrator_source('sw')
             delay_samples = (None if self._smith_delay_samples is None else
                              int(self._smith_delay_samples))
@@ -376,7 +337,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             raise RuntimeError('disable the lock before changing tracking algorithm')
         if algorithm not in ('conventional', 'smith_linear'):
             raise ValueError('algorithm must be "conventional" or "smith_linear"')
-        if algorithm == 'smith_linear' and self._pyrpl.rp.lockin.smith_filter_name is None:
+        if algorithm == 'smith_linear' and self._odmr.lockin(0).smith_filter_name is None:
             raise ValueError('This minimum-phase FPGA profile has no Smith-compatible filter')
         if smith_gain_multiplier is not None:
             value = float(smith_gain_multiplier)
@@ -391,19 +352,25 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._tracking_algorithm = algorithm
         self._lock.smith_enable = False
         if algorithm == 'smith_linear':
-            lock_in = self._pyrpl.rp.lockin
-            modeled_filter = lock_in.smith_filter_name
-            lock_in.fir_bypass_ch1 = False
-            lock_in.demod_bypass_ch1 = False
-            lock_in.filter_select_ch1 = modeled_filter
-            self._configured_lock_in_filters[0] = modeled_filter
+            self._assert_smith_filter()
         self._lock.clear()
         delay_for_log = (self._smith_delay_samples if self._smith_delay_samples is not None
-                         else self._pyrpl.rp.lockin.linear_group_delay_samples)
+                         else self._odmr.lockin(0).linear_group_delay_samples)
         self.log.info(
             'Tracking algorithm selected: %s (Smith gain x%.3g, delay %d samples)',
             algorithm, float(self._smith_gain_multiplier),
             int(delay_for_log))
+
+    def _assert_smith_filter(self) -> str:
+        """Put resonance-1 channel 1 on the FIR the Smith model represents
+        (no FIR bypass, no demodulation bypass); returns the filter name."""
+        modeled_filter = self._odmr.lockin(0).smith_filter_name
+        self._odmr.set_demod_filter(modeled_filter, bypass=False, chains=(0,),
+                                    channels=(1,), owner=self.module_name)
+        self._odmr.set_demod_bypass(False, chains=(0,), channels=(1,),
+                                    owner=self.module_name)
+        self._configured_lock_in_filters[0] = modeled_filter
+        return modeled_filter
 
     def set_bandwidth_pi(self, bandwidth_hz: float, slope_lsb_per_hz: float,
                          zero_ratio: float = 3.0) -> None:
@@ -434,23 +401,16 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
     def get_filter_capabilities(self) -> Dict[str, bool]:
         """Lock-in FIR filters of the loaded FPGA image, {name: available}."""
-        return dict(self._pyrpl.rp.lockin.filter_capabilities)
+        return self._odmr.filter_capabilities
 
     def get_demod_filter(self) -> Dict[str, Any]:
         """FIR selection of resonance-1 lock-in channel 1 (the tracked lane)."""
-        lock_in = self._pyrpl.rp.lockin
-        return dict(filter=lock_in.filter_select_ch1,
-                    bypass=bool(lock_in.fir_bypass_ch1),
-                    smith_filter=lock_in.smith_filter_name,
-                    fpga_profile=lock_in.capabilities)
+        return self._odmr.demod_filter(0)
 
     def set_demod_filter(self, filter_name: Optional[str], bypass: bool) -> Dict[str, Any]:
         """Set FIR bypass and, if given, the FIR of lock-in channel 1; returns the readback."""
-        lock_in = self._pyrpl.rp.lockin
-        lock_in.fir_bypass_ch1 = bool(bypass)
-        if filter_name is not None:
-            lock_in.filter_select_ch1 = filter_name
-        return self.get_demod_filter()
+        return self._odmr.set_demod_filter(filter_name, bypass=bool(bypass), chains=(0,),
+                                           channels=(1,), owner=self.module_name)[0]
 
     def clear(self) -> None:
         """Clear integrator state."""
@@ -503,15 +463,13 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
     def _require_multitrack(self):
         if self._multitrack is None:
-            raise RuntimeError('Multi-resonance tracking unavailable: rp.odmrmultitrack '
-                               'not present (old bitstream?).')
+            raise RuntimeError('Red Pitaya ODMR lock is not active')
 
     def _configure_hop_trigger_pin(self):
         """Route the scan LO-hop trigger to DIO7_P as an inverted (idle-high,
         active-low) module output, matching the Windfreak active-low trigger input."""
         try:
-            self._pyrpl.rp.hk.configure_pin('P7', direction='output',
-                                            source='module', invert=True)
+            self._odmr.configure_trigger_output()
             self.log.debug('DIO7_P configured as inverted scan-trigger output for LO hopping')
         except Exception as e:
             self.log.warning(f'Could not configure DIO7 hop-trigger pin: {e}')
@@ -601,7 +559,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         convention (odmr_multitrack.demod_phase is invert=True like iq0.phase), so
         set the oscillator demod_phase equal to this to reproduce the scan demod."""
         try:
-            return float(self._pyrpl.rp.iq0.phase)
+            return self._odmr.demod_phase
         except Exception as e:
             self.log.warning(f'Could not read iq0 phase: {e}')
             return 0.0
@@ -634,27 +592,12 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self.log.info(f'Multitrack oscillator {"enabled" if enable else "disabled"}')
 
     def set_integrator_source(self, source: str = 'current_step') -> None:
-        """Select which slot integrates / which cal slot is active: hardware hop
-        index ('current_step') or software ('sw'). Applies to both the per-slot
-        integrators (odmrfreqlock) and the cal-slot bank (fgen3)."""
-        if source not in ('current_step', 'sw'):
-            raise ValueError(f"source must be 'current_step' or 'sw', got {source}")
-        hw = (source == 'current_step')
-        self._lock.active_slot_src = hw
-        if not hw:
-            try:
-                self._lock.active_slot = 0
-            except Exception:
-                pass
-        if self._fgen3 is not None:
-            self._fgen3.active_slot_src = hw
-            if not hw:
-                try:
-                    self._fgen3.active_slot = 0
-                except Exception:
-                    pass
-        self.log.info(f'Integrator + cal-slot source set to {source} '
-                      f'(active_slot_src={hw})')
+        """Select which resonance is live: hardware hop index ('current_step') or
+        software ('sw', resonance 0). Applies consistently to the per-slot
+        integrators (odmrfreqlock), the cal-slot bank (fgen3) and the multitrack
+        oscillator channel."""
+        self._odmr.set_active_channel_source(source, channel=0)
+        self.log.info(f'Active resonance source set to {source}')
 
     def clear_integrators(self) -> None:
         """Clear all per-slot integrator states."""
@@ -705,6 +648,10 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._streaming_traces = False
 
         self._single_slot_no_hop = self._nslots == 1
+        # Hopping programs the sequencer; N=1 resets its step index. Either way
+        # it must not be in use by a finite sweep. N>1 keeps the claim until
+        # stop_tracking.
+        self._odmr.claim_sequencer(self.module_name)
         if self._single_slot_no_hop:
             self.set_integrator_source('sw')
             try:
@@ -714,12 +661,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 self._scan.num_steps = 1
             except Exception as e:
                 self.log.warning(f'Could not reset scan current_step for N=1 tracking: {e}')
-            if self._fgen3 is not None:
-                try:
-                    self._fgen3.active_slot_src = False
-                    self._fgen3.active_slot = 0
-                except Exception:
-                    pass
+            finally:
+                self._odmr.release_sequencer(self.module_name)
 
         # Mark the engine active before starting its two independent components so
         # a caller can reliably use stop_tracking() to clean up a partial failure.
@@ -764,6 +707,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self._streaming_traces = False
             self._single_slot_no_hop = False
             self._mapped_scan_active = False
+            self._odmr.release_sequencer(self.module_name)
         self.log.info('Multi-resonance tracking stopped')
 
     def _start_trace_stream_hardware(self) -> None:
@@ -838,7 +782,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         rec = self._streamer.reconstruct_tracking(
             self._trace_events, nslots=self._nslots,
             interval=self._sample_period_cycles,
-            correction_converter=self._scan.ftw_to_hz)
+            correction_converter=self._odmr.ftw_to_hz)
         err = self._ffill_marked_rows(rec['err'], rec['step'])
         corr_hz = self._ffill_marked_rows(rec['corr'], rec['step'])
         cic = self._ffill_marked_rows(rec['cic'], rec['step'])
@@ -1008,7 +952,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         rec = self._streamer.reconstruct_tracking(
             events, nslots=self._nslots,
             interval=self._sample_period_cycles,
-            correction_converter=self._scan.ftw_to_hz)
+            correction_converter=self._odmr.ftw_to_hz)
         times = ((rec['ticks'] - rec['ticks'][0]).astype(np.float64) /
                  self._fpga_clock_hz
                  if rec['ticks'].size else np.empty(0, dtype=np.float64))
