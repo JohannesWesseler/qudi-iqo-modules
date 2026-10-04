@@ -50,7 +50,7 @@ physical voltage offsets of the output channels.
 
 FM Implementation:
 -----------------
-- FM modulation frequency is set via iq0 module (shared for all components)
+- FM modulation frequency is set on the reference oscillator (shared by all components)
 - FM deviation can be set independently for each component
 - FM can be enabled/disabled independently for each component
 
@@ -296,7 +296,7 @@ class RedPitayaIFSource(IFSourceBase):
         are global, set once via the normal single-LO configuration). It only writes
         the per-LO SSB correction (amplitudes + DAC-B phase + carrier-null DC) into
         the chosen cal slot, which the FPGA selects in lockstep with the LO hop when
-        ``fgen3.active_slot_src`` follows ``current_step``.
+        live resonance channel follows ``current_step``.
 
         Args:
             slot: cal-slot index (0..nslots-1) = resonance index.
@@ -352,7 +352,7 @@ class RedPitayaIFSource(IFSourceBase):
 
     def set_fm_modulation_frequency(self, frequency: float, phase_offset: float = None) -> None:
         """
-        Set the FM modulation frequency (iq0 reference oscillator).
+        Set the FM modulation frequency (reference oscillator).
 
         Both lock-in chains are switched to the phase-shifted reference, and the
         reference square wave is put on DIO1_P for an external lock-in.
@@ -388,7 +388,7 @@ class RedPitayaIFSource(IFSourceBase):
 
     def set_iq_phase_offset(self, phase_offset: float) -> None:
         """
-        Set the demodulation phase offset of the reference (iq0.phase).
+        Set the demodulation phase offset of the reference oscillator.
 
         Parameters:
         -----------

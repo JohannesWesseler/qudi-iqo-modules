@@ -76,7 +76,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             settling_time: 100e-6  # settling time after trigger in seconds
             input_channel: 'in1'  # 'in1' or 'in2' (hardwired to in1 in FPGA)
             signal_scale: 1.0  # Scale factor to convert ADC units to physical units
-            input_select: 'demod'  # 'adc', 'iq0', or 'demod'
+            input_select: 'demod'  # 'adc' or 'demod'
 
             # Lock-in filter options (only used when input_select='demod'):
             lock_in_fir_bypass_ch1: False  # True: CIC only (~15 kHz BW, ~160 µs latency)
@@ -98,7 +98,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
         'minimum_demod_samples_per_point', default=16, missing='info')
     _input_channel = ConfigOption('input_channel', default='in1', missing='info')
     _signal_scale = ConfigOption('signal_scale', default=1.0, missing='info')
-    _input_select = ConfigOption('input_select', default='adc', missing='info')  # 'adc', 'iq0', or 'demod'
+    _input_select = ConfigOption('input_select', default='adc', missing='info')  # 'adc' or 'demod'
 
     # Lock-in filter configuration (applies when input_select='demod')
     # FIR bypass: True = CIC only (~15 kHz BW, ~160 µs latency), False = CIC+FIR
@@ -160,7 +160,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             self._scan_module.settling_time = self._settling_time
 
             # Set input select from config
-            valid_inputs = {'adc', 'iq0', 'demod'}
+            valid_inputs = {'adc', 'demod'}
             if self._input_select not in valid_inputs:
                 self.log.warning(f'Invalid input_select "{self._input_select}" specified. Falling back to "adc".')
                 self._input_select = 'adc'

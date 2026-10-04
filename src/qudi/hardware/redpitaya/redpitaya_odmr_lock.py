@@ -554,14 +554,13 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self._field_drain_active = False
 
     def get_iq_demod_phase(self) -> float:
-        """Current iq0 demod phase [deg] (the legacy/scan reference phase you tune
-        visually on the ODMR curve). The oscillator's demod_phase uses the SAME sign
-        convention (odmr_multitrack.demod_phase is invert=True like iq0.phase), so
-        set the oscillator demod_phase equal to this to reproduce the scan demod."""
+        """Current demodulation phase [deg] of the reference oscillator (the phase you
+        tune on the ODMR curve). Scans and tracking share this one oscillator, so the
+        value configured for tracking also applies to later scans."""
         try:
             return self._odmr.demod_phase
         except Exception as e:
-            self.log.warning(f'Could not read iq0 phase: {e}')
+            self.log.warning(f'Could not read the demodulation phase: {e}')
             return 0.0
 
     def configure_oscillator(self, f_m_hz: float, demod_phase_deg: float,

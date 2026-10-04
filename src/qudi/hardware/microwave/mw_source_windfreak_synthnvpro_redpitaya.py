@@ -846,11 +846,13 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             f'(LO={lo_frequency/1e9:.6f} GHz)')
 
     def set_cal_slot_source(self, hardware: bool = True):
-        """Make the fgen3 cal-slot follow the live hop index (``current_step``) when
-        True (the tracking mode), or use the software-selected slot when False."""
-        self._redpitaya.fgen3.active_slot_src = bool(hardware)
-        self.log.info(f'fgen3 cal-slot source = '
-                      f'{"current_step (hardware)" if hardware else "software"}')
+        """Make the live resonance (and with it the fgen3 cal slot) follow the hop
+        index (``current_step``) when True (the tracking mode), or fix resonance 0
+        when False. The cal slot follows the live channel in hardware."""
+        self._redpitaya.odmr.set_active_channel_source(
+            'current_step' if hardware else 'sw', channel=0)
+        self.log.info(f'Live resonance source = '
+                      f'{"current_step (hardware)" if hardware else "software, channel 0"}')
 
     def _windfreak_off(self):
         """Turn off Windfreak output."""
