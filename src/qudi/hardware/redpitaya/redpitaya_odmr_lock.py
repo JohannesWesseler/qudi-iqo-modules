@@ -432,6 +432,26 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         """Get current lock status."""
         return self._lock.get_status()
 
+    def get_filter_capabilities(self) -> Dict[str, bool]:
+        """Lock-in FIR filters of the loaded FPGA image, {name: available}."""
+        return dict(self._pyrpl.rp.lockin.filter_capabilities)
+
+    def get_demod_filter(self) -> Dict[str, Any]:
+        """FIR selection of resonance-1 lock-in channel 1 (the tracked lane)."""
+        lock_in = self._pyrpl.rp.lockin
+        return dict(filter=lock_in.filter_select_ch1,
+                    bypass=bool(lock_in.fir_bypass_ch1),
+                    smith_filter=lock_in.smith_filter_name,
+                    fpga_profile=lock_in.capabilities)
+
+    def set_demod_filter(self, filter_name: Optional[str], bypass: bool) -> Dict[str, Any]:
+        """Set FIR bypass and, if given, the FIR of lock-in channel 1; returns the readback."""
+        lock_in = self._pyrpl.rp.lockin
+        lock_in.fir_bypass_ch1 = bool(bypass)
+        if filter_name is not None:
+            lock_in.filter_select_ch1 = filter_name
+        return self.get_demod_filter()
+
     def clear(self) -> None:
         """Clear integrator state."""
         self._lock.clear()

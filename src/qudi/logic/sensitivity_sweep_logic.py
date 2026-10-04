@@ -296,6 +296,13 @@ class SensitivitySweepLogic(LogicBase):
     # =========================================================================
 
     @QtCore.Slot(dict, dict, dict)
+    def _filter_capabilities(self):
+        """Lock-in filters of the loaded FPGA image, from the lock hardware."""
+        lock_hw = self._odmr_lock_hw()
+        if lock_hw is None:
+            raise ValueError('Filter selection requires the odmr_lock_hw connector')
+        return lock_hw.get_filter_capabilities()
+
     def configure_sweep(self,
                        sweep_params: Dict[str, np.ndarray],
                        odmr_params: Dict[str, Any],
@@ -337,7 +344,7 @@ class SensitivitySweepLogic(LogicBase):
 
             profiles = stream_params.get('filter_sweep', [])
             if stream_params.get('fir_filter_bandwidth') == '10kHz_minphase_2048':
-                capabilities = self._time_series_logic()._streamer()._pyrpl.rp.lockin.filter_capabilities
+                capabilities = self._filter_capabilities()
                 if not capabilities.get('10kHz_minphase_2048'):
                     raise ValueError('The selected 10 kHz filter requires the /2048 N=3 M=1 FPGA image')
                 if any(mode in ('smith_linear', 'closed_loop_smith')
@@ -348,7 +355,7 @@ class SensitivitySweepLogic(LogicBase):
                 if any(mode in ('smith_linear', 'closed_loop_smith')
                        for mode in stream_params.get('tracking_modes', [])):
                     raise ValueError('Minimum-phase filter comparison requires Smith disabled')
-                capabilities = self._time_series_logic()._streamer()._pyrpl.rp.lockin.filter_capabilities
+                capabilities = self._filter_capabilities()
                 for profile in profiles:
                     name = profile['fir_filter_bandwidth']
                     if name not in ('6kHz_minphase', '10kHz_minphase') or not capabilities.get(name):
@@ -1105,23 +1112,13 @@ class SensitivitySweepLogic(LogicBase):
                     streamer.set_stream_input('demod')
                     self.log.info('Stream input set to "demod"')
 
-            # Access pyrpl instance from streamer
-            if not hasattr(streamer, '_pyrpl') or streamer._pyrpl is None:
+            # The lock-in filter belongs to the frequency-lock hardware.
+            lock_hw = self._odmr_lock_hw()
+            if lock_hw is None:
                 if self._stream_parameters.get('filter_sweep'):
-                    raise RuntimeError('Cannot apply comparison filter: PyRPL unavailable')
-                self.log.warning('Cannot access pyrpl instance from streamer - lock-in filters not configured')
+                    raise RuntimeError('Cannot apply comparison filter: odmr_lock_hw not connected')
+                self.log.warning('odmr_lock_hw not connected - lock-in filters not configured')
                 return
-
-            pyrpl_instance = streamer._pyrpl
-
-            # Access lockin module (named 'lockin' not 'lock_in' per PyRPL naming convention)
-            if not hasattr(pyrpl_instance.rp, 'lockin'):
-                if self._stream_parameters.get('filter_sweep'):
-                    raise RuntimeError('Cannot apply comparison filter: lock-in unavailable')
-                self.log.warning('lockin module not available in pyrpl - filters not configured')
-                return
-
-            lock_in = pyrpl_instance.rp.lockin
 
             # The implemented Smith model explicitly represents the compiled
             # linear-phase FIR delay.  A bypassed or minimum-phase lane is a
@@ -1129,7 +1126,7 @@ class SensitivitySweepLogic(LogicBase):
             # misleading.  This also protects against a GUI StatusVar retaining
             # the 20 kHz selection when switching back to the /4096 image.
             if smith_requested:
-                smith_filter = lock_in.smith_filter_name
+                smith_filter = lock_hw.get_demod_filter()['smith_filter']
                 if fir_bypass:
                     self.log.warning(
                         'FIR bypass is incompatible with the Smith comparison; '
@@ -1141,15 +1138,12 @@ class SensitivitySweepLogic(LogicBase):
                         f'using advertised filter "{smith_filter}" for all conditions')
                     fir_filter_bw = smith_filter
 
-            # Configure FIR bypass
-            lock_in.fir_bypass_ch1 = fir_bypass
-            self.log.debug(f'Set fir_bypass_ch1 = {fir_bypass}')
-
-            # Configure filter bandwidth (only effective when bypass is False)
+            # Filter bandwidth (only effective when bypass is False)
+            filter_name = None
             if not fir_bypass:
                 # Validate against the FIRs actually compiled into this image.
                 valid_filters = {
-                    name for name, available in lock_in.filter_capabilities.items()
+                    name for name, available in lock_hw.get_filter_capabilities().items()
                     if available and name != 'fir_bypass'}
                 if '2kHz_minphase' in valid_filters:
                     valid_filters.add('2kHz')
@@ -1163,13 +1157,12 @@ class SensitivitySweepLogic(LogicBase):
                         f'Invalid filter selection "{fir_filter_bw}", '
                         f'using "{fallback_filter}"')
                     fir_filter_bw = fallback_filter
+                filter_name = fir_filter_bw
 
-                lock_in.filter_select_ch1 = fir_filter_bw
-                self.log.debug(f'Set filter_select_ch1 = {fir_filter_bw}')
-
-            # Verify settings were applied
-            actual_bypass = lock_in.fir_bypass_ch1
-            actual_filter = lock_in.filter_select_ch1
+            # Apply and verify
+            applied = lock_hw.set_demod_filter(filter_name, fir_bypass)
+            actual_bypass = applied['bypass']
+            actual_filter = applied['filter']
             # Persist the effective hardware selection, rather than a stale GUI
             # choice, into the run metadata and subsequent condition records.
             self._stream_parameters['fir_bypass'] = bool(actual_bypass)
@@ -1217,13 +1210,12 @@ class SensitivitySweepLogic(LogicBase):
         except Exception as e:
             snapshot['max_correction_error'] = str(e)
         try:
-            pyrpl_instance = getattr(lock_hw, '_pyrpl', None)
-            if pyrpl_instance is not None:
-                lockin = pyrpl_instance.rp.lockin
-                snapshot['fpga_profile'] = lockin.capabilities
-                snapshot['filter_capabilities'] = lockin.filter_capabilities
-                snapshot['filter_select_ch1'] = lockin.filter_select_ch1
-                snapshot['fir_bypass_ch1'] = bool(lockin.fir_bypass_ch1)
+            demod_filter = lock_hw.get_demod_filter()
+            if demod_filter:
+                snapshot['fpga_profile'] = demod_filter['fpga_profile']
+                snapshot['filter_capabilities'] = lock_hw.get_filter_capabilities()
+                snapshot['filter_select_ch1'] = demod_filter['filter']
+                snapshot['fir_bypass_ch1'] = bool(demod_filter['bypass'])
         except Exception as e:
             snapshot['fpga_profile_error'] = str(e)
         return json_safe(snapshot)

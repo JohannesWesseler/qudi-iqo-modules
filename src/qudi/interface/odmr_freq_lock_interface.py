@@ -20,7 +20,7 @@ qudi. If not, see <https://www.gnu.org/licenses/>.
 """
 
 from abc import abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from qudi.core.module import Base
 
 
@@ -96,6 +96,41 @@ class OdmrFreqLockInterface(Base):
                 - kp_hz_per_lsb (float): Proportional gain (Hz/LSB, 0 if I-only)
         """
         pass
+
+    def get_filter_capabilities(self) -> Dict[str, bool]:
+        """
+        Demodulation filters of the loaded firmware.
+
+        Returns:
+            dict {filter name: available}. Hardware without selectable
+            filters returns an empty dict.
+        """
+        return {}
+
+    def get_demod_filter(self) -> Dict[str, Any]:
+        """
+        Current demodulation filter of the tracked channel.
+
+        Returns:
+            dict with keys 'filter' (str), 'bypass' (bool), 'smith_filter'
+            (filter the Smith model assumes, or None) and 'fpga_profile'
+            (dict). Empty for hardware without selectable filters.
+        """
+        return {}
+
+    def set_demod_filter(self, filter_name: Optional[str], bypass: bool) -> Dict[str, Any]:
+        """
+        Select the demodulation filter of the tracked channel.
+
+        Args:
+            filter_name: one of get_filter_capabilities(); None keeps the
+                current selection.
+            bypass: True passes the decimator output without the FIR.
+
+        Returns:
+            The applied setting, as get_demod_filter().
+        """
+        raise NotImplementedError('This hardware has no selectable demodulation filter')
 
     @abstractmethod
     def clear(self) -> None:
