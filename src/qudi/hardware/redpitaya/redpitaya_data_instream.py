@@ -14,12 +14,13 @@ Architecture:
 - A background receiver thread on the PC (pyrpl ``StreamClient``) drains the
   socket continuously into its own buffer; this module only pulls from it.
 - Supports two input modes: demodulated lock-in data or FTW frequency corrections
-- Lost samples (genuine FPGA-ring overruns only) are reported explicitly and
-  **NaN-filled** so the time axis stays truthful -- never silently dropped.
+- Samples are read on the lock-in's sample grid from hardware timestamps; any
+  lost sample (FPGA, ARM server or transport) is reported and **NaN-filled** so
+  the time axis stays truthful -- never silently dropped.
 - Supports both CONTINUOUS and FINITE streaming modes
 
-See ``docs/developer_guide/streaming_architecture.md`` in the pyrpl repo for the
-full design and wire protocol.
+See ``docs/developer_guide/data_streaming.md`` in the pyrpl repo for the full
+design and wire protocol.
 
 Example config:
 
@@ -163,10 +164,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._scan_resume_input = 'demod'
         self._scan_tap = None        # display tap into the scan's feed (fan-out)
         self._scan_reader = None
-        self._scan_events = None
         self._scan_data_source = 'fir'
-        self._scan_x_seen = 0
-        self._scan_y_seen = 0
+        # Marker indices returned by the reader but not yet requested by the scan.
+        self._scan_markers = {'x_position': [], 'y_position': []}
 
         # Push-streaming receiver (pyrpl StreamClient) + a small FIFO of samples
         # already drained from it but not yet handed to the consumer. The
@@ -175,7 +175,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._rx = None              # pyrpl StreamClient
         self._pending = np.empty(0, dtype=np.float64)  # calibrated, unconsumed
         self._total_samples_acquired = 0
-        self._last_gap_reported = 0  # for gap (NaN) delta logging
+        self._last_gap_reported = 0  # for missing-sample (NaN) delta logging
 
         # Sleep interval while blocking for more samples in read_data_into_buffer
         self._poll_interval = 0.005
@@ -397,6 +397,8 @@ class RedPitayaDataInStream(DataInStreamInterface):
                     if not self._scan_active and self._data_streamer is not None:
                         source = 'fir' if input_mode == 'demod' else 'correction'
                         self._data_streamer.update_subscription(self._rx, (source,))
+                        # The reader starts a new sample grid for the new source.
+                        self._last_gap_reported = 0
                     self.log.info(f'Stream input switched live to: {input_mode}')
                 else:
                     self.log.info(f'Stream input set to: {input_mode} (FPGA register updated)')
@@ -580,9 +582,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
                 tuple(sources), poll_us=50,
                 ring_bytes=int(ring_bytes) if ring_bytes else int(self._stream_ring_bytes),
                 coalesce_us=int(coalesce_us) if coalesce_us else int(self._stream_coalesce_us))
-            self._scan_events = np.empty(0, dtype=self._data_streamer.EVENT_DTYPE)
-            self._scan_x_seen = 0
-            self._scan_y_seen = 0
+            self._scan_markers = {'x_position': [], 'y_position': []}
             self._scan_active = True
             self.log.info("KDC_HW_SYNC subscribed to Region-11 events (input='%s').",
                           input_source)
@@ -601,31 +601,37 @@ class RedPitayaDataInStream(DataInStreamInterface):
             self._scan_reader = None
 
     def mapped_stream_read(self):
-        """Return new scalar scan samples while retaining marker metadata."""
+        """Return new raw scan samples on a uniform grid (NaN = missing sample).
+
+        Concatenating successive results gives one array whose index is the
+        sample index used by :meth:`read_x_markers`/:meth:`read_y_markers`: a
+        marker value ``m`` means sample ``m`` is the first sample at or after the
+        position pulse. Lost samples are NaN, so the indices stay aligned.
+        """
         if self._scan_reader is None:
             return np.empty(0, dtype=np.float64)
-        events = self._scan_reader.read_events()
-        if events.size:
-            self._scan_events = np.concatenate((self._scan_events, events))
-        return self._data_streamer.select(events, self._scan_data_source)['data'].astype(np.float64)
-
-    def _new_scan_markers(self, axis):
-        if self._scan_events is None or not self._scan_events.size:
-            return np.empty(0, dtype=np.int64)
-        rec = self._data_streamer.reconstruct_tracking(
-            self._scan_events, interval=self._demod_decimation)
-        key = '%s_position' % axis
-        seen_name = '_scan_%s_seen' % axis
-        seen = getattr(self, seen_name)
-        values = rec[key][seen:]
-        setattr(self, seen_name, rec[key].size)
+        values, markers = self._scan_reader.read_mapped(
+            self._scan_data_source, self._demod_decimation,
+            markers=('x_position', 'y_position'))
+        for name, indices in markers.items():
+            if indices.size:
+                self._scan_markers[name].append(indices)
         return values
 
+    def _new_scan_markers(self, name):
+        # Markers are collected by mapped_stream_read() together with the samples
+        # they index; return the ones not yet handed out.
+        chunks = self._scan_markers.get(name, [])
+        self._scan_markers[name] = []
+        if not chunks:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate(chunks)
+
     def read_x_markers(self):
-        return self._new_scan_markers('x')
+        return self._new_scan_markers('x_position')
 
     def read_y_markers(self):
-        return self._new_scan_markers('y')
+        return self._new_scan_markers('y_position')
 
     def ftw_to_hz(self, values):
         return self._scan_module.ftw_to_hz(values)
@@ -640,8 +646,10 @@ class RedPitayaDataInStream(DataInStreamInterface):
         if self._rx is None:
             return 0
         try:
-            # float64 already, with NaN where the FPGA overran the ARM drainer.
-            raw_data = self._rx.read()
+            # One sample per lock-in period, NaN wherever a sample was lost (in the
+            # FPGA, the ARM server or the transport), so the time axis is exact.
+            source = 'correction' if self._current_stream_input == 'ftw_corr' else 'fir'
+            raw_data = self._rx.read_uniform(source, self._demod_decimation)
 
             if raw_data.size == 0:
                 # Surface receiver-thread errors even when no data arrives.
@@ -665,14 +673,16 @@ class RedPitayaDataInStream(DataInStreamInterface):
             n_samples = calibrated_data.size
             self._total_samples_acquired += n_samples
 
-            # Surface genuine FPGA-ring overruns (NaN-filled gaps) to the user.
+            # Surface lost samples (NaN-filled grid points) to the user.
             stats = self._rx.stats()
-            n_gap = stats.get('n_gap', 0)
-            if n_gap > self._last_gap_reported:
-                new_gap = n_gap - self._last_gap_reported
-                self._last_gap_reported = n_gap
-                msg = (f'Stream overrun: {new_gap} lost samples NaN-filled '
-                       f'(total gap {n_gap}). Read faster or reduce other load.')
+            n_missing = stats.get('n_missing', 0)
+            if n_missing > self._last_gap_reported:
+                new_gap = n_missing - self._last_gap_reported
+                self._last_gap_reported = n_missing
+                msg = (f'Stream loss: {new_gap} samples NaN-filled (total '
+                       f'{n_missing}; transport gap {stats.get("n_gap", 0)} words, '
+                       f'tap drops {stats.get("n_dropped", 0)} words). '
+                       f'Read faster or reduce other load.')
                 if self._streaming_mode == StreamingMode.FINITE:
                     self.log.error('FINITE mode data loss: ' + msg)
                 else:

@@ -1349,7 +1349,7 @@ class SensitivitySweepLogic(LogicBase):
         # FIR samples are not discarded merely because a metadata bit is absent.
         if error_signal.size and not np.any(np.isfinite(error_signal)):
             fir_events = data_streamer.select(events, 'fir')
-            fir_ticks = data_streamer.unwrap_counter(fir_events['timestamp'])
+            fir_ticks = data_streamer.event_ticks(fir_events)
             origin = int(reconstruction['ticks'][0])
             fir_index = np.rint(
                 (fir_ticks.astype(np.int64) - origin) /
@@ -1368,8 +1368,9 @@ class SensitivitySweepLogic(LogicBase):
             'wall_duration_s': time.monotonic() - started,
             'event_count': int(events.size),
             'observed_event_rate_hz': float(events.size / max(duration, 1e-12)),
+            # 12 bytes per record on the wire (header, time, payload)
             'event_payload_rate_MBps': float(
-                events.size * data_streamer.EVENT_DTYPE.itemsize /
+                events.size * 12 /
                 max(duration, 1e-12) / 1e6),
             'fir_event_count': int(data_streamer.select(events, 'fir').size),
             'correction_event_count': int(
