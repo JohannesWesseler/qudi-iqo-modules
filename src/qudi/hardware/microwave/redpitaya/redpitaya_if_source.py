@@ -4,13 +4,13 @@ Red Pitaya IF Source Module - Multi-Frequency IQ Signal Generation with FM Suppo
 
 This module implements the IFSourceBase interface for Red Pitaya devices using the
 PyRPL library. It provides calibrated IQ signal generation with support for up to
-3 simultaneous frequency components using the fgen3 FPGA module, with optional
+3 simultaneous frequency components using the ifsynth FPGA module, with optional
 frequency modulation (FM) capability.
 
 Hardware:
 ---------
 - Device: Red Pitaya (STEMlab 125-14 or compatible)
-- FPGA Module: fgen3 (3-component frequency generator with FM)
+- FPGA Module: ifsynth (3-component frequency generator with FM)
 - Outputs: 2 channels (Out1 = I, Out2 = Q)
 
 Key Features:
@@ -96,8 +96,8 @@ rp_source.disconnect()
 
 Implementation Notes:
 --------------------
-1. The fgen3 module must be properly configured in the FPGA bitstream
-2. Signal routing is configured to route fgen3 outputs to Out1 (I) and Out2 (Q)
+1. The ifsynth module must be properly configured in the FPGA bitstream
+2. Signal routing is configured to route ifsynth outputs to Out1 (I) and Out2 (Q)
 3. Each frequency component can be independently enabled/disabled
 4. Phase accumulator is 32-bit for high frequency resolution
 5. Calibration data is cached after loading for efficiency
@@ -125,7 +125,7 @@ class RedPitayaIFSource(IFSourceBase):
         self.port = port
         self.pyrpl = None
         self.odmr = None
-        self.fgen3 = None
+        self.ifsynth = None
         self._config_name = None
         self._current_config = None
         self._calibration_data = {}
@@ -151,7 +151,7 @@ class RedPitayaIFSource(IFSourceBase):
             self.logger.info(f"Acquired shared pyrpl instance for {self.hostname} with config '{self._config_name}'")
 
             self.odmr = self.pyrpl.odmr
-            self.fgen3 = self.odmr.synth
+            self.ifsynth = self.odmr.synth
             self.odmr.route_if_outputs()
 
             self._is_connected = True
@@ -164,12 +164,12 @@ class RedPitayaIFSource(IFSourceBase):
     def disconnect(self) -> None:
         """Disconnect from the Red Pitaya."""
         try:
-            if self.fgen3:
+            if self.ifsynth:
                 self.odmr.set_if_output(False)
                 # Disable all components and their FM
                 for i in range(self._max_components):
-                    setattr(self.fgen3, f'enable{i}', False)
-                    setattr(self.fgen3, f'fm_enable{i}', False)
+                    setattr(self.ifsynth, f'enable{i}', False)
+                    setattr(self.ifsynth, f'fm_enable{i}', False)
                 self.logger.debug("Red Pitaya output disabled")
 
             if self.pyrpl:
@@ -307,8 +307,8 @@ class RedPitayaIFSource(IFSourceBase):
         """
         if len(frequencies) != len(amplitudes):
             raise ValueError('frequencies and amplitudes must have the same length')
-        if not (0 <= slot < self.fgen3.nslots):
-            raise ValueError(f'slot must be in 0..{self.fgen3.nslots - 1}, got {slot}')
+        if not (0 <= slot < self.ifsynth.nslots):
+            raise ValueError(f'slot must be in 0..{self.ifsynth.nslots - 1}, got {slot}')
 
         # ensure calibration data is loaded for each IF frequency
         for freq in frequencies:
@@ -345,7 +345,7 @@ class RedPitayaIFSource(IFSourceBase):
         dc_a = float(np.mean(dc_offsets_i)) if dc_offsets_i else 0.0
         dc_b = float(np.mean(dc_offsets_q)) if dc_offsets_q else 0.0
 
-        self.fgen3.load_cal_slot(slot, comps, dc_a, dc_b)
+        self.ifsynth.load_cal_slot(slot, comps, dc_a, dc_b)
         self.logger.info(
             f'Loaded SSB cal into slot {slot} for LO={lo_frequency / 1e9:.6f} GHz '
             f'({len(comps)} comps, dc_a={dc_a:.5f}, dc_b={dc_b:.5f})')
@@ -425,8 +425,8 @@ class RedPitayaIFSource(IFSourceBase):
 
         # Disable all components first
         for i in range(self._max_components):
-            setattr(self.fgen3, f'enable{i}', False)
-            setattr(self.fgen3, f'fm_enable{i}', False)
+            setattr(self.ifsynth, f'enable{i}', False)
+            setattr(self.ifsynth, f'fm_enable{i}', False)
 
         # Configure active components
         for i, component in enumerate(config.components):
@@ -455,23 +455,23 @@ class RedPitayaIFSource(IFSourceBase):
             raise ValueError(f"Component index {component_index} exceeds maximum ({self._max_components - 1})")
 
         # Set frequency
-        setattr(self.fgen3, f'frequency{component_index}', config.frequency)
+        setattr(self.ifsynth, f'frequency{component_index}', config.frequency)
 
         # Set amplitudes
-        setattr(self.fgen3, f'amplitude_a{component_index}', config.amplitude_i)
-        setattr(self.fgen3, f'amplitude_b{component_index}', config.amplitude_q)
+        setattr(self.ifsynth, f'amplitude_a{component_index}', config.amplitude_i)
+        setattr(self.ifsynth, f'amplitude_b{component_index}', config.amplitude_q)
 
         # Set phase. I-phase (DAC A) is hardwired to 0 in the FPGA (cal-slot bank);
         # only the DAC-B (Q) phase offset is programmable.
-        setattr(self.fgen3, f'phase_offset_b{component_index}', config.phase_q)
+        setattr(self.ifsynth, f'phase_offset_b{component_index}', config.phase_q)
 
         # Set FM parameters
-        setattr(self.fgen3, f'fm_enable{component_index}', config.fm_enabled)
+        setattr(self.ifsynth, f'fm_enable{component_index}', config.fm_enabled)
         if config.fm_enabled:
-            setattr(self.fgen3, f'fm_deviation_khz{component_index}', int(config.fm_deviation_khz))
+            setattr(self.ifsynth, f'fm_deviation_khz{component_index}', int(config.fm_deviation_khz))
 
         # Enable the component
-        setattr(self.fgen3, f'enable{component_index}', config.enabled)
+        setattr(self.ifsynth, f'enable{component_index}', config.enabled)
 
         self.logger.debug(f"Component {component_index} configured: "
                           f"freq={config.frequency / 1e6:.3f} MHz, "
@@ -492,8 +492,8 @@ class RedPitayaIFSource(IFSourceBase):
         if not self._is_connected:
             raise RuntimeError("Red Pitaya not connected")
 
-        self.fgen3.overall_dc_offset_a = i_offset
-        self.fgen3.overall_dc_offset_b = q_offset
+        self.ifsynth.overall_dc_offset_a = i_offset
+        self.ifsynth.overall_dc_offset_b = q_offset
 
         if self._current_config:
             self._current_config.dc_offset_i = i_offset
@@ -520,10 +520,10 @@ class RedPitayaIFSource(IFSourceBase):
 
         # Apply corrections. I-phase (DAC A) is hardwired to 0 in the FPGA cal-slot
         # bank, so only amplitudes and the DAC-B phase offset are written.
-        setattr(self.fgen3, f'amplitude_a{component_index}', amp_i)
-        setattr(self.fgen3, f'amplitude_b{component_index}', amp_q)
-        setattr(self.fgen3, f'phase_offset_b{component_index}', phase_q)
-        setattr(self.fgen3, f'enable{component_index}', True)
+        setattr(self.ifsynth, f'amplitude_a{component_index}', amp_i)
+        setattr(self.ifsynth, f'amplitude_b{component_index}', amp_q)
+        setattr(self.ifsynth, f'phase_offset_b{component_index}', phase_q)
+        setattr(self.ifsynth, f'enable{component_index}', True)
 
         if self._current_config and component_index < len(self._current_config.components):
             comp = self._current_config.components[component_index]
@@ -545,10 +545,10 @@ class RedPitayaIFSource(IFSourceBase):
 
         # Set amplitude on component 0 for backward compatibility
         # (I-phase / DAC A offset is hardwired to 0 in the FPGA cal-slot bank).
-        self.fgen3.amplitude_a0 = amplitude
-        self.fgen3.amplitude_b0 = amplitude
-        self.fgen3.phase_offset_b0 = self._q_base_phase_deg()
-        self.fgen3.enable0 = True
+        self.ifsynth.amplitude_a0 = amplitude
+        self.ifsynth.amplitude_b0 = amplitude
+        self.ifsynth.phase_offset_b0 = self._q_base_phase_deg()
+        self.ifsynth.enable0 = True
 
         self.logger.debug(f"Amplitude set to {amplitude:.3f} on component 0")
 
@@ -556,8 +556,8 @@ class RedPitayaIFSource(IFSourceBase):
         """Set the IF signal amplitude using calibration. For backward compatibility."""
         # Use the convenience method with a single frequency
         # Assume the frequency is already set on component 0
-        if hasattr(self.fgen3, 'frequency0') and self.fgen3.frequency0:
-            frequency = self.fgen3.frequency0
+        if hasattr(self.ifsynth, 'frequency0') and self.ifsynth.frequency0:
+            frequency = self.ifsynth.frequency0
         else:
             # Default to a common IF frequency if not set
             frequency = 21.580e6
@@ -573,18 +573,18 @@ class RedPitayaIFSource(IFSourceBase):
             # Read current configuration from device
             components = []
             for i in range(self._max_components):
-                if getattr(self.fgen3, f'enable{i}', False):
+                if getattr(self.ifsynth, f'enable{i}', False):
                     components.append(IQComponentConfig(
-                        frequency=getattr(self.fgen3, f'frequency{i}'),
-                        amplitude=(getattr(self.fgen3, f'amplitude_a{i}') +
-                                   getattr(self.fgen3, f'amplitude_b{i}')) / 2,
-                        amplitude_i=getattr(self.fgen3, f'amplitude_a{i}'),
-                        amplitude_q=getattr(self.fgen3, f'amplitude_b{i}'),
+                        frequency=getattr(self.ifsynth, f'frequency{i}'),
+                        amplitude=(getattr(self.ifsynth, f'amplitude_a{i}') +
+                                   getattr(self.ifsynth, f'amplitude_b{i}')) / 2,
+                        amplitude_i=getattr(self.ifsynth, f'amplitude_a{i}'),
+                        amplitude_q=getattr(self.ifsynth, f'amplitude_b{i}'),
                         phase_i=0.0,  # I-phase hardwired to 0 in the FPGA cal-slot bank
-                        phase_q=getattr(self.fgen3, f'phase_offset_b{i}'),
+                        phase_q=getattr(self.ifsynth, f'phase_offset_b{i}'),
                         enabled=True,
-                        fm_enabled=getattr(self.fgen3, f'fm_enable{i}', False),
-                        fm_deviation_khz=getattr(self.fgen3, f'fm_deviation_khz{i}', 0)
+                        fm_enabled=getattr(self.ifsynth, f'fm_enable{i}', False),
+                        fm_deviation_khz=getattr(self.ifsynth, f'fm_deviation_khz{i}', 0)
                     ))
 
             fm_mod_freq = None
@@ -595,8 +595,8 @@ class RedPitayaIFSource(IFSourceBase):
 
             self._current_config = IQDeviceConfig(
                 components=components,
-                dc_offset_i=self.fgen3.overall_dc_offset_a,
-                dc_offset_q=self.fgen3.overall_dc_offset_b,
+                dc_offset_i=self.ifsynth.overall_dc_offset_a,
+                dc_offset_q=self.ifsynth.overall_dc_offset_b,
                 fm_modulation_frequency=fm_mod_freq
             )
 
@@ -614,10 +614,10 @@ class RedPitayaIFSource(IFSourceBase):
             pass
 
         status = {
-            'gen_enable': self.fgen3.gen_enable,
-            'output_zero': self.fgen3.output_zero,
-            'dc_offset_a': self.fgen3.overall_dc_offset_a,
-            'dc_offset_b': self.fgen3.overall_dc_offset_b,
+            'gen_enable': self.ifsynth.gen_enable,
+            'output_zero': self.ifsynth.output_zero,
+            'dc_offset_a': self.ifsynth.overall_dc_offset_a,
+            'dc_offset_b': self.ifsynth.overall_dc_offset_b,
             'fm_modulation_frequency': fm_mod_freq,
             'components': []
         }
@@ -625,14 +625,14 @@ class RedPitayaIFSource(IFSourceBase):
         for i in range(self._max_components):
             comp_status = {
                 'index': i,
-                'enabled': getattr(self.fgen3, f'enable{i}'),
-                'frequency': getattr(self.fgen3, f'frequency{i}'),
-                'amplitude_a': getattr(self.fgen3, f'amplitude_a{i}'),
-                'amplitude_b': getattr(self.fgen3, f'amplitude_b{i}'),
+                'enabled': getattr(self.ifsynth, f'enable{i}'),
+                'frequency': getattr(self.ifsynth, f'frequency{i}'),
+                'amplitude_a': getattr(self.ifsynth, f'amplitude_a{i}'),
+                'amplitude_b': getattr(self.ifsynth, f'amplitude_b{i}'),
                 'phase_offset_a': 0.0,  # I-phase hardwired to 0 in the FPGA cal-slot bank
-                'phase_offset_b': getattr(self.fgen3, f'phase_offset_b{i}'),
-                'fm_enabled': getattr(self.fgen3, f'fm_enable{i}'),
-                'fm_deviation_khz': getattr(self.fgen3, f'fm_deviation_khz{i}')
+                'phase_offset_b': getattr(self.ifsynth, f'phase_offset_b{i}'),
+                'fm_enabled': getattr(self.ifsynth, f'fm_enable{i}'),
+                'fm_deviation_khz': getattr(self.ifsynth, f'fm_deviation_khz{i}')
             }
             status['components'].append(comp_status)
 

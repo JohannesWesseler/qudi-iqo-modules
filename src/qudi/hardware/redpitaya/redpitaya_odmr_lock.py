@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Red Pitaya ODMR Frequency Lock Hardware Interface.
+Red Pitaya ODMR resonance tracking (one or more resonances).
 
-Wraps PyRPL's odmr_freq_lock module for Qudi integration.
+Implements OdmrTrackingInterface on the pyrpl ODMR image through the shared
+instrument layer (``Pyrpl.odmr``).
 
 Copyright (c) 2021, the qudi developers. See the AUTHORS.md file at the top-level
 directory of this distribution and on <https://github.com/Ulm-IQO/qudi-core/>
@@ -25,24 +26,20 @@ import threading
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from qudi.core.configoption import ConfigOption
-from qudi.interface.odmr_freq_lock_interface import OdmrFreqLockInterface
-from qudi.interface.multi_resonance_tracking_interface import MultiResonanceTrackingInterface
+from qudi.interface.odmr_tracking_interface import OdmrTrackingInterface
 from qudi.hardware.redpitaya.resource_manager import get_pyrpl_instance, release_pyrpl_instance
 
 
-class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInterface):
+class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
     """
-    Hardware interface to Red Pitaya ODMR frequency lock via PyRPL.
+    ODMR resonance tracking on the Red Pitaya (pyrpl ODMR image).
 
-    Implements both the single-resonance ``OdmrFreqLockInterface`` (wraps the
-    region-8 lock loop ``rp.odmrfreqlock``) and the multi-resonance
-    ``MultiResonanceTrackingInterface`` (additionally wraps the region-9
-    oscillator/freeze ``rp.odmrmultitrack``, the per-slot integrators, and the
-    region-5 ``rp.scan`` continuous-hop loop + push stream + hop markers). The
-    overlapping method names (enable_lock, set_invert, set_max_correction_hz,
-    set_bandwidth) have identical semantics across the two interfaces, so a single
-    implementation satisfies both. The per-resonance SSB cal + LO jump-list live on
-    the microwave/IF source module, not here.
+    Uses the frequency controller ``rp.odmrfreqlock`` (one integrator slot per
+    resonance), the reference oscillator ``rp.reference``, channel control
+    ``rp.channels`` (live resonance, freeze window), the sequencer ``rp.scan``
+    (LO hopping for N > 1) and the Region-11 data streamer (traces). N = 1 is
+    the same path with resonance 0 live and no hopping. The per-resonance SSB
+    calibration and the LO jump list live on the microwave/IF source module.
 
     Config example:
         redpitaya_odmr_lock:
@@ -87,15 +84,15 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._pyrpl = None
         self._odmr = None
         self._lock = None
-        self._multitrack = None
-        self._fgen3 = None
+        self._reference = None
+        self._channels = None
         self._scan = None
         self._streamer = None
         self._stream_reader = None
         self._fpga_clock_hz = 0
         self._sample_period_cycles = 0
         self._stream_sample_rate_hz = 0.0
-        # multi-resonance tracking state
+        # acquisition engine state
         self._tracking_active = False
         self._streaming_traces = False
         self._single_slot_no_hop = False
@@ -116,7 +113,6 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         # (settable live via set_trace_window_seconds; initialized from the
         # max_trace_samples ConfigOption in on_activate).
         self._trace_window_words = 2_000_000
-        self._stream_source = 'events'
         self._configured_lock_in_filters = ['2kHz_minphase', '2kHz_minphase']
         # 2D motor-scan takeover: while True the motor scan owns the physical stream
         # drain (read_stream_words), so read_traces must NOT also drain (word theft).
@@ -133,7 +129,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._stream_lock = threading.RLock()
 
     def on_activate(self):
-        """Connect to PyRPL and get the lock / multitrack / fgen3 / scan modules."""
+        """Connect to PyRPL and get the controller, reference, channel and scan modules."""
         # Get shared PyRPL instance via resource manager
         self._pyrpl, _ = get_pyrpl_instance(
             hostname=self._redpitaya_hostname,
@@ -147,8 +143,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         # Cross-module settings go through the shared ODMR instrument layer.
         self._odmr = self._pyrpl.odmr
         self._lock = self._odmr.lock
-        self._multitrack = self._odmr.oscillator
-        self._fgen3 = self._odmr.synth
+        self._reference = self._odmr.reference
+        self._channels = self._odmr.channels
         self._scan = self._odmr.sequencer
         self._streamer = self._odmr.streamer
         firmware = self._odmr.check_firmware()
@@ -167,18 +163,14 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
         self._stream_words_per_sample = 1
 
-        # Multitrack routes resonance 1 through lockin channel 1 and resonance 2
-        # through lockin1 channel 1. Configure both instances explicitly.
+        # Resonance 1 is demodulated in lock-in chain 0, resonance 2 in chain 1;
+        # configure both explicitly.
         self._configure_lock_in_filters()
 
-        # Ensure lock + oscillator are disabled on activation
+        # Lock off, resonance 0 live, nothing frozen.
         self._lock.enable = False
         self._lock.smith_enable = False
-        if self._multitrack is not None:
-            try:
-                self._multitrack.enable = False
-            except Exception as e:
-                self.log.warning(f'Could not disable multitrack oscillator on activation: {e}')
+        self._odmr.enable_channel_selection(False)
 
         self.log.info(
             'Red Pitaya ODMR Lock connected: %s; rate=%.6f Hz, period=%d clocks, '
@@ -188,7 +180,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def _configure_lock_in_filters(self) -> None:
         """Apply the per-resonance FIR selection to both lock-in chains.
 
-        Channel 1 is the multitrack data path; channel 2 is kept in step so it
+        Channel 1 is the tracked lane; channel 2 is kept in step so it
         is ready if the quadrature lane is used later.
         """
         modeled_filter = self._odmr.lockin(0).smith_filter_name
@@ -239,19 +231,19 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         """Disable lock and disconnect."""
         try:
             if self._tracking_active:
-                self.stop_tracking()
+                self.stop_engine()
         except Exception as e:
-            self.log.warning(f'Could not stop multi-resonance tracking on deactivation: {e}')
+            self.log.warning(f'Could not stop the tracking engine on deactivation: {e}')
         if self._lock is not None:
             try:
                 self._lock.enable = False
             except Exception as e:
                 self.log.warning(f'Could not disable lock on deactivation: {e}')
-        if self._multitrack is not None:
+        if self._channels is not None:
             try:
-                self._multitrack.enable = False
+                self._odmr.enable_channel_selection(False)
             except Exception as e:
-                self.log.warning(f'Could not disable multitrack on deactivation: {e}')
+                self.log.warning(f'Could not disable channel selection on deactivation: {e}')
 
         # Release pyrpl instance
         if self._odmr is not None:
@@ -265,19 +257,20 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self._odmr = None
 
         self._lock = None
+        self._reference = None
+        self._channels = None
         self.log.info('Red Pitaya ODMR Lock deactivated')
 
     # =========================================================================
-    # OdmrFreqLockInterface Implementation
+    # Controller
     # =========================================================================
 
     def set_bandwidth(self, bandwidth_hz: float, slope_lsb_per_hz: float,
-                      pi: bool = False, zero_ratio: float = 3.0) -> None:
+                      pi: bool = False, zero_ratio: float = 1.0) -> None:
         """Configure the loop gains (integral-only, or PI if ``pi=True``).
 
-        Satisfies both OdmrFreqLockInterface (single-res, 2 args) and
-        MultiResonanceTrackingInterface (adds ``pi``/``zero_ratio``). The gains are
-        global (shared by all slots in hardware).
+        The gains are global (shared by all slots in hardware). With
+        ``tracking_algorithm='smith_linear'`` the I+Smith controller is used.
         """
         if bandwidth_hz <= 0:
             raise ValueError(f'Bandwidth must be positive, got {bandwidth_hz}')
@@ -293,7 +286,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             # activation. Reassert the modeled path immediately before configuring
             # the controller, then let the FPGA compatibility input verify it.
             modeled_filter = self._assert_smith_filter()
-            self.set_integrator_source('sw')
+            self._odmr.set_active_channel_source('sw', channel=0)
             delay_samples = (None if self._smith_delay_samples is None else
                              int(self._smith_delay_samples))
             self._lock.set_bandwidth_smith(
@@ -372,24 +365,6 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._configured_lock_in_filters[0] = modeled_filter
         return modeled_filter
 
-    def set_bandwidth_pi(self, bandwidth_hz: float, slope_lsb_per_hz: float,
-                         zero_ratio: float = 3.0) -> None:
-        """Configure PI frequency lock with zero placement."""
-        if bandwidth_hz <= 0:
-            raise ValueError(f'Bandwidth must be positive, got {bandwidth_hz}')
-        if slope_lsb_per_hz <= 0:
-            raise ValueError(f'Slope must be positive, got {slope_lsb_per_hz}')
-        if not 0.1 <= zero_ratio <= 30.0:
-            raise ValueError(f'Zero ratio must be in [0.1, 30.0], got {zero_ratio}')
-
-        self._lock.set_bandwidth_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)
-
-        self.log.info(
-            f'Lock configured (PI): BW={bandwidth_hz:.1f} Hz, '
-            f'slope={slope_lsb_per_hz:.3e} LSB/Hz, α={zero_ratio:.2f} '
-            f'(zero at {bandwidth_hz/zero_ratio:.1f} Hz)'
-        )
-
     def enable_lock(self, enable: bool) -> None:
         """Enable or disable frequency lock."""
         self._lock.enable = bool(enable)
@@ -411,11 +386,6 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         """Set FIR bypass and, if given, the FIR of lock-in channel 1; returns the readback."""
         return self._odmr.set_demod_filter(filter_name, bypass=bool(bypass), chains=(0,),
                                            channels=(1,), owner=self.module_name)[0]
-
-    def clear(self) -> None:
-        """Clear integrator state."""
-        self._lock.clear()
-        self.log.debug('Lock integrator cleared')
 
     def get_constraints(self) -> Dict[str, Any]:
         """Get hardware constraints."""
@@ -458,11 +428,11 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         return self._lock.invert
 
     # =========================================================================
-    # MultiResonanceTrackingInterface Implementation
+    # Reference, channel control and acquisition engine
     # =========================================================================
 
-    def _require_multitrack(self):
-        if self._multitrack is None:
+    def _require_active(self):
+        if self._channels is None:
             raise RuntimeError('Red Pitaya ODMR lock is not active')
 
     def _configure_hop_trigger_pin(self):
@@ -501,12 +471,6 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def field_drain_active(self) -> bool:
         """True while a single-position field logger owns the physical stream drain."""
         return bool(self._field_drain_active)
-
-    @property
-    def stream_source(self) -> str:
-        """Current reconstruction source: 'marked' (fresh-only, per-visit exact) or
-        the legacy ZOH-filled 'dual'."""
-        return getattr(self, '_stream_source', 'marked')
 
     @property
     def stream_sample_rate(self) -> float:
@@ -553,50 +517,33 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         with self._stream_lock:
             self._field_drain_active = False
 
-    def get_iq_demod_phase(self) -> float:
-        """Current demodulation phase [deg] of the reference oscillator (the phase you
-        tune on the ODMR curve). Scans and tracking share this one oscillator, so the
-        value configured for tracking also applies to later scans."""
-        try:
-            return self._odmr.demod_phase
-        except Exception as e:
-            self.log.warning(f'Could not read the demodulation phase: {e}')
-            return 0.0
+    def get_demod_phase(self) -> float:
+        """Demodulation phase [deg] of the reference oscillator. Scans and
+        tracking share the oscillator, so it applies to both."""
+        return float(self._odmr.demod_phase)
 
-    def configure_oscillator(self, f_m_hz: float, demod_phase_deg: float,
-                             settle_time_s: float, source: str = 'current_step') -> None:
-        """Configure the per-channel modulation oscillator and freeze window."""
-        self._require_multitrack()
-        if source not in ('current_step', 'sw'):
-            raise ValueError(f"source must be 'current_step' or 'sw', got {source}")
-        self._multitrack.frequency = float(f_m_hz)
-        self._multitrack.demod_phase = float(demod_phase_deg)
-        self._multitrack.settle_time = float(settle_time_s)
-        self._multitrack.src = source
-        if source == 'sw':
-            try:
-                self._multitrack.sw_channel = 0
-            except Exception:
-                pass
-        self.log.info(
-            f'Oscillator configured: f_m={f_m_hz/1e3:.4f} kHz, '
-            f'demod_phase={demod_phase_deg:.1f} deg, settle={settle_time_s*1e6:.0f} us, '
-            f'src={source}'
-        )
+    def configure_reference(self, f_m_hz: float, demod_phase_deg: float) -> None:
+        """Set the modulation frequency and the demodulation phase."""
+        self._require_active()
+        self._odmr.set_fm_frequency(float(f_m_hz))
+        self._odmr.set_demod_phase(float(demod_phase_deg))
+        self.log.info(f'Reference: f_m={f_m_hz/1e3:.4f} kHz, '
+                      f'demod_phase={demod_phase_deg:.1f} deg')
 
-    def enable_oscillator(self, enable: bool) -> None:
-        """Enable/disable the multi-channel oscillator + freeze gating."""
-        self._require_multitrack()
-        self._multitrack.enable = bool(enable)
-        self.log.info(f'Multitrack oscillator {"enabled" if enable else "disabled"}')
-
-    def set_integrator_source(self, source: str = 'current_step') -> None:
-        """Select which resonance is live: hardware hop index ('current_step') or
-        software ('sw', resonance 0). Applies consistently to the per-slot
-        integrators (odmrfreqlock), the cal-slot bank (fgen3) and the multitrack
-        oscillator channel."""
+    def configure_channels(self, settle_time_s: float,
+                           source: str = 'current_step') -> None:
+        """Set the freeze window after each hop and the live-resonance source
+        ('current_step' = hop index, 'sw' = resonance 0)."""
+        self._require_active()
+        self._channels.settle_time = float(settle_time_s)
         self._odmr.set_active_channel_source(source, channel=0)
-        self.log.info(f'Active resonance source set to {source}')
+        self.log.info(f'Channels: settle={settle_time_s*1e6:.0f} us, source={source}')
+
+    def enable_channel_selection(self, enable: bool) -> None:
+        """Enable channel selection and freeze gating (off: resonance 0 live)."""
+        self._require_active()
+        self._odmr.enable_channel_selection(bool(enable))
+        self.log.info(f'Channel selection {"enabled" if enable else "disabled"}')
 
     def clear_integrators(self) -> None:
         """Clear all per-slot integrator states."""
@@ -621,15 +568,15 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         (the GUI reads these)."""
         return [self.get_slot_status(s) for s in range(self.nslots)]
 
-    def start_tracking(self, nslots: int, dwell_time_s: float,
-                       settling_time_s: float, trigger_length_s: float,
-                       stream_traces: bool = True) -> None:
-        """Start indefinite hardware-driven LO hopping over ``nslots`` resonances."""
-        self._require_multitrack()
+    def start_engine(self, nslots: int, dwell_time_s: float,
+                     settling_time_s: float, trigger_length_s: float,
+                     stream_traces: bool = True) -> None:
+        """Start the acquisition engine (LO hopping for ``nslots`` > 1)."""
+        self._require_active()
         if self._scan is None:
             raise RuntimeError('rp.scan not available; cannot start hopping.')
         if self._tracking_active:
-            self.log.warning('Multi-resonance tracking already active; ignoring start.')
+            self.log.warning('Tracking engine already active; ignoring start.')
             return
 
         self._nslots = int(nslots)
@@ -649,10 +596,10 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._single_slot_no_hop = self._nslots == 1
         # Hopping programs the sequencer; N=1 resets its step index. Either way
         # it must not be in use by a finite sweep. N>1 keeps the claim until
-        # stop_tracking.
+        # stop_engine.
         self._odmr.claim_sequencer(self.module_name)
         if self._single_slot_no_hop:
-            self.set_integrator_source('sw')
+            self._odmr.set_active_channel_source('sw', channel=0)
             try:
                 if self._scan.busy:
                     self._scan.stop()
@@ -664,7 +611,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 self._odmr.release_sequencer(self.module_name)
 
         # Mark the engine active before starting its two independent components so
-        # a caller can reliably use stop_tracking() to clean up a partial failure.
+        # a caller can reliably use stop_engine() to clean up a partial failure.
         self._tracking_active = True
 
         if stream_traces:
@@ -683,14 +630,14 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
 
         self._tracking_active = True
         self.log.info(
-            f'Multi-resonance tracking started: N={self._nslots}, '
+            f'Tracking engine started: N={self._nslots}, '
             f'dwell={dwell_time_s*1e6:.0f} us, settle={settling_time_s*1e6:.0f} us, '
             f'stream_traces={stream_traces}'
             + (' (single-slot no-hop: dwell/settle ignored)' if self._single_slot_no_hop else '')
         )
 
-    def stop_tracking(self) -> None:
-        """Stop continuous hopping (and the trace stream if running)."""
+    def stop_engine(self) -> None:
+        """Stop hopping and the trace stream."""
         if not self._tracking_active:
             return
         try:
@@ -707,7 +654,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self._single_slot_no_hop = False
             self._mapped_scan_active = False
             self._odmr.release_sequencer(self.module_name)
-        self.log.info('Multi-resonance tracking stopped')
+        self.log.info('Tracking engine stopped')
 
     def _start_trace_stream_hardware(self) -> None:
         """Start/reset only the push-stream side of the tracking engine."""
@@ -721,7 +668,6 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             ('fir', 'cic', 'correction', 'step', 'x_position',
              'y_position', 'window'), poll_us=50,
             ring_bytes=32 << 20, coalesce_us=500)
-        self._stream_source = 'events'
         self._stream_words_per_sample = 1
         self._streaming_traces = True
 
@@ -730,11 +676,11 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         if not self._tracking_active:
             raise RuntimeError('Start the hopping/acquisition engine before streaming.')
         if self._streaming_traces:
-            self.log.warning('Multi-resonance trace stream already active.')
+            self.log.warning('Trace stream already active.')
             return
         with self._stream_lock:
             self._start_trace_stream_hardware()
-        self.log.info('Multi-resonance trace stream started independently.')
+        self.log.info('Trace stream started.')
 
     def stop_trace_stream(self) -> None:
         """Stop traces without changing hopping or the FPGA lock state."""
@@ -752,7 +698,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self._stream_reader = None
             self._streaming_traces = False
             self._mapped_scan_active = False
-        self.log.info('Multi-resonance trace stream stopped independently.')
+        self.log.info('Trace stream stopped.')
 
     def read_traces(self) -> Optional[Dict[str, Any]]:
         """Reconstructed per-resonance high-rate traces since session start (capped).
@@ -882,7 +828,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         with self._stream_lock:
             if enable and not (self._tracking_active and self._streaming_traces):
                 raise RuntimeError(
-                    'KDC_HW_SYNC_MULTIRES needs an active multi-resonance trace stream. '
+                    'KDC_HW_SYNC_MULTIRES needs an active tracking trace stream. '
                     'Configure tracking and click Start Stream first; Start Tracking is '
                     'optional (open-loop error mapping is supported).')
             if enable:
@@ -957,4 +903,5 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                  if rec['ticks'].size else np.empty(0, dtype=np.float64))
         return {'err': rec['err'], 'corr_hz': rec['corr'], 'cic': rec['cic'],
                 'times': times, 'dead': rec['dead'],
+                'ticks': rec['ticks'].astype(np.int64), 'clock_hz': self._fpga_clock_hz,
                 'sample_rate': self._stream_sample_rate_hz}

@@ -846,7 +846,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             f'(LO={lo_frequency/1e9:.6f} GHz)')
 
     def set_cal_slot_source(self, hardware: bool = True):
-        """Make the live resonance (and with it the fgen3 cal slot) follow the hop
+        """Make the live resonance (and with it the ifsynth cal slot) follow the hop
         index (``current_step``) when True (the tracking mode), or fix resonance 0
         when False. The cal slot follows the live channel in hardware."""
         self._redpitaya.odmr.set_active_channel_source(
@@ -961,7 +961,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             if enable is not None:
                 self._enable_fm = bool(enable)
                 # Also update the per-component enables list, which is what
-                # configure_scan() actually reads when setting up fgen3 FM.
+                # configure_scan() actually reads when setting up ifsynth FM.
                 if hasattr(self, '_fm_enables_per_component') and self._fm_enables_per_component:
                     self._fm_enables_per_component = [self._enable_fm] * len(self._fm_enables_per_component)
                 elif hasattr(self, '_if_frequencies'):
@@ -1033,7 +1033,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         """Enable or disable direct DC ODMR mode (bypasses lock-in demodulation).
 
         When enabled:
-        - FM modulation is disabled on fgen3
+        - FM modulation is disabled on ifsynth
         - Lock-in demodulation bypass is activated (ADC goes through CIC/FIR only)
         - The ODMR signal is measured as a direct DC fluorescence level change
 
@@ -1115,7 +1115,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         self.set_sideband(sideband)
 
     def calibration_set_dc_offsets(self, i_offset: float, q_offset: float) -> None:
-        """Set DC offsets on the RedPitaya fgen3 for IQ calibration.
+        """Set DC offsets on the RedPitaya ifsynth for IQ calibration.
 
         This method directly sets the DC offsets used for LO leakage cancellation.
         DC offsets are in normalized units (-1.0 to 1.0).
@@ -1132,7 +1132,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
     def calibration_set_iq_correction(self, g: float, phi: float, amplitude: float,
                                        component_index: int = 0) -> tuple:
-        """Apply IQ imbalance correction to fgen3 for calibration.
+        """Apply IQ imbalance correction to ifsynth for calibration.
 
         This applies gain imbalance (g) and phase imbalance (phi) corrections
         to minimize image power during IQ mixer calibration.
@@ -1181,15 +1181,15 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
                 # Ensure only the selected component contributes to the output during calibration.
                 for i in range(max_components):
-                    setattr(self._redpitaya.fgen3, f'enable{i}', False)
-                    setattr(self._redpitaya.fgen3, f'fm_enable{i}', False)
+                    setattr(self._redpitaya.ifsynth, f'enable{i}', False)
+                    setattr(self._redpitaya.ifsynth, f'fm_enable{i}', False)
 
-                setattr(self._redpitaya.fgen3, f'amplitude_a{component_index}', amplitude)
-                setattr(self._redpitaya.fgen3, f'amplitude_b{component_index}', amplitude)
-                setattr(self._redpitaya.fgen3, f'phase_offset_a{component_index}', 0.0)
-                setattr(self._redpitaya.fgen3, f'phase_offset_b{component_index}',
+                setattr(self._redpitaya.ifsynth, f'amplitude_a{component_index}', amplitude)
+                setattr(self._redpitaya.ifsynth, f'amplitude_b{component_index}', amplitude)
+                setattr(self._redpitaya.ifsynth, f'phase_offset_a{component_index}', 0.0)
+                setattr(self._redpitaya.ifsynth, f'phase_offset_b{component_index}',
                         270.0 if self._sideband == 'upper' else 90.0)
-                setattr(self._redpitaya.fgen3, f'enable{component_index}', True)
+                setattr(self._redpitaya.ifsynth, f'enable{component_index}', True)
                 self.log.debug(f'IF amplitude set to {amplitude:.3f} (uncorrected)')
             else:
                 raise RuntimeError('Red Pitaya not connected')
@@ -1208,12 +1208,12 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
                 # Ensure only the selected component contributes to the output during calibration.
                 for i in range(max_components):
-                    setattr(self._redpitaya.fgen3, f'enable{i}', False)
-                    setattr(self._redpitaya.fgen3, f'fm_enable{i}', False)
+                    setattr(self._redpitaya.ifsynth, f'enable{i}', False)
+                    setattr(self._redpitaya.ifsynth, f'fm_enable{i}', False)
 
-                setattr(self._redpitaya.fgen3, f'frequency{component_index}', frequency_hz)
-                setattr(self._redpitaya.fgen3, f'fm_enable{component_index}', False)
-                setattr(self._redpitaya.fgen3, f'enable{component_index}', True)
+                setattr(self._redpitaya.ifsynth, f'frequency{component_index}', frequency_hz)
+                setattr(self._redpitaya.ifsynth, f'fm_enable{component_index}', False)
+                setattr(self._redpitaya.ifsynth, f'enable{component_index}', True)
                 self.log.debug(f'IF frequency set to {frequency_hz / 1e6:.3f} MHz')
             else:
                 raise RuntimeError('Red Pitaya not connected')

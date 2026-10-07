@@ -126,7 +126,7 @@ We calibrate over a 2D grid (LO frequencies × IF amplitudes). During operation 
 │   measurement            │  │                                  │
 └──────────────────────────┘  │         ▼                        │
                               │   RedPitayaIFSource              │
-                              │   (fgen3 FPGA module)            │
+                              │   (ifsynth FPGA module)            │
                               └──────────────────────────────────┘
 ```
 
@@ -157,7 +157,7 @@ Implements `SpectrumMeasurementInterface`:
 
 #### `MicrowaveRedPitayaWindfreak` (extended)
 Added calibration methods that delegate to `RedPitayaIFSource`:
-- `calibration_set_dc_offsets(i, q)` → sets `fgen3.overall_dc_offset_a/b`
+- `calibration_set_dc_offsets(i, q)` → sets `ifsynth.overall_dc_offset_a/b`
 - `calibration_set_iq_correction(g, phi, amp)` → applies amplitude/phase correction
 - `calibration_set_if_amplitude(amp)` → sets uncorrected amplitude
 - `calibration_set_if_frequency(freq_hz)` → sets IF frequency
@@ -391,7 +391,7 @@ When `enable_sfdr_measurement: true` (default):
 | Symptom | Cause | Solution |
 |---------|-------|----------|
 | Optimization doesn't converge | Tolerances too tight | Increase `fatol` to 5 dB |
-| Poor LO suppression | DC offset range exceeded | Check fgen3 limits (±1.0) |
+| Poor LO suppression | DC offset range exceeded | Check ifsynth limits (±1.0) |
 | Poor image rejection | Phase out of range | Verify φ stays within ±30° |
 | Interpolation warnings | Point outside calibration grid | Expand LO/amplitude ranges |
 | Calibration degrades over time | Temperature drift | Recalibrate after thermal equilibrium |

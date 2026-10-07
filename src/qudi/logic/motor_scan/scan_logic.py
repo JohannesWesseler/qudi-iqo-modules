@@ -77,11 +77,9 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
     _odmr_logic = Connector(interface='LogicBase', name='odmr_logic', optional=True)
     _time_series_logic = Connector(interface='LogicBase',
                                    name='time_series_logic', optional=True)
-    _odmr_frequency_tracking_logic = Connector(
-        interface='LogicBase',
-        name='odmr_frequency_tracking_logic',
-        optional=True
-    )
+    # ODMR tracking logic (odmr_tracking_logic), for CONTINUOUS_FREQ_TRACK.
+    _tracking_logic = Connector(interface='LogicBase', name='tracking_logic',
+                                optional=True)
     # Shared Red Pitaya stream owner. When connected, KDC_HW_SYNC routes the board's
     # single push stream through this owner (begin/end_scan_stream) so a marker-mode
     # scan cleanly takes over from / restores the monitor stream instead of starting
@@ -89,14 +87,14 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
     # the pyrpl scan module directly (headless tests).
     _streamer = Connector(interface='DataInStreamInterface', name='streamer',
                           optional=True)
-    # Multi-resonance tracking hardware (redpitaya_odmr_lock). Required only for the
-    # KDC_HW_SYNC_MULTIRES mode: the tracker owns the continuous LO-hop loop + the
-    # self-describing MARKED stream, and this logic asks it to add x/y markers and to
-    # drain/reconstruct the per-resonance traces for spatial binning. The user
-    # configures + starts the trace stream in the Multi-Resonance ODMR Tracking GUI;
-    # the FPGA lock may independently be on (closed loop) or off (open loop).
-    _multi_track_hw = Connector(interface='MultiResonanceTrackingInterface',
-                                name='multi_track_hw', optional=True)
+    # Tracking hardware (redpitaya_odmr_lock). Required only for the
+    # KDC_HW_SYNC_MULTIRES mode: the tracker owns the acquisition engine and the
+    # trace stream, and this logic asks it to add x/y markers and to drain and
+    # reconstruct the per-resonance traces for spatial binning. The user configures
+    # and starts the trace stream in the ODMR Tracking GUI; the FPGA lock may
+    # independently be on (closed loop) or off (open loop).
+    _tracking_hw = Connector(interface='OdmrTrackingInterface',
+                             name='tracking_hw', optional=True)
 
     # Config options
     _default_scan_mode = ConfigOption(
@@ -376,6 +374,27 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
 
         self.log.info("MotorScanLogic activated.")
     
+    def _set_monitor_stream_input(self, input_mode):
+        """Select what the monitor stream (redpitaya_stream) carries: 'demod'
+        (demodulated error) or 'ftw_corr' (frequency correction)."""
+        streamer = None
+        try:
+            streamer = self._streamer()
+        except Exception:
+            pass
+        if streamer is None:
+            try:
+                streamer = self._time_series_logic()._streamer()
+            except Exception:
+                streamer = None
+        if streamer is None or not hasattr(streamer, 'set_stream_input'):
+            self.log.warning('No stream module to set the input to %s', input_mode)
+            return
+        try:
+            streamer.set_stream_input(input_mode)
+        except Exception as e:
+            self.log.warning(f'Could not set the stream input to {input_mode}: {e}')
+
     def on_deactivate(self):
         """Clean up on deactivation."""
         # Stop any running scan
@@ -786,7 +805,7 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                     return
             elif mode == ScanMode.CONTINUOUS_FREQ_TRACK:
                 # Validate all required components for frequency tracking
-                tracking_logic = self._odmr_frequency_tracking_logic()
+                tracking_logic = self._tracking_logic()
                 if tracking_logic is None:
                     self.log.error("ODMR frequency tracking logic not connected. "
                                    "Cannot perform CONTINUOUS_FREQ_TRACK scan.")
@@ -799,15 +818,23 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
+                # The correction stream belongs to the live resonance, so this
+                # mode needs single-resonance tracking.
+                if int(tracking_logic.num_resonances) != 1:
+                    self.log.error("CONTINUOUS_FREQ_TRACK needs N=1 tracking; use "
+                                   "KDC_HW_SYNC_MULTIRES for two resonances.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
                 # Check lock is enabled
-                if not tracking_logic.lock_enabled:
+                if not tracking_logic.tracking_active:
                     self.log.error("Lock not enabled. Enable frequency tracking in the "
                                    "ODMR Tracking GUI before starting scan.")
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
                 # Check zero-crossing is available
-                zero_crossing = tracking_logic.zero_crossing_frequency
+                zero_crossing = tracking_logic.resonance_frequencies[0]
                 if zero_crossing is None:
                     self.log.error("No zero-crossing frequency available. Perform ODMR fit "
                                    "in Tracking GUI first.")
@@ -840,13 +867,13 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
             elif mode == ScanMode.KDC_HW_SYNC_MULTIRES:
-                # Needs the multi-resonance tracker (which owns the LO-hop loop + the
-                # MARKED trace stream) with STREAMING already running, and a motor
+                # Needs the tracker (which owns the acquisition engine and the
+                # trace stream) with STREAMING already running, and a motor
                 # driver exposing setup_position_trigger.
-                hw = self._get_multi_track_hw()
+                hw = self._get_tracking_hw()
                 if hw is None:
-                    self.log.error("KDC_HW_SYNC_MULTIRES needs the 'multi_track_hw' "
-                                   "connector (multi-resonance tracking hardware).")
+                    self.log.error("KDC_HW_SYNC_MULTIRES needs the 'tracking_hw' "
+                                   "connector (tracking hardware).")
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
@@ -857,7 +884,7 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                     return
                 if not bool(getattr(hw, 'trace_stream_active', False)):
                     message = ('KDC_HW_SYNC_MULTIRES needs Start Stream in the '
-                               'Multi-Resonance ODMR Tracking GUI; Start Tracking '
+                               'ODMR Tracking GUI; Start Tracking '
                                'is optional.')
                     self.log.error(message)
                     self.sigScanStatusMessage.emit(message)
@@ -921,14 +948,8 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                 # Clear raw data buffer (will receive FTW values, convert to frequency)
                 self._ts_raw_data_buffer = {ch: [] for ch in channel_names}
 
-                # Configure tracking logic for FTW streaming
-                tracking_logic = self._odmr_frequency_tracking_logic()
-                if tracking_logic is not None:
-                    try:
-                        tracking_logic.set_stream_mode('correction')
-                        self.log.debug("Set tracking stream mode to 'correction' (FTW output)")
-                    except Exception as e:
-                        self.log.warning(f"Could not set stream mode: {e}")
+                # Stream the frequency correction instead of the demodulated error
+                self._set_monitor_stream_input('ftw_corr')
 
                 # Connect to time series for data (same as CONTINUOUS_STREAM)
                 ts_logic = self._time_series_logic()
@@ -965,7 +986,7 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
             elif mode == ScanMode.KDC_HW_SYNC_MULTIRES:
                 # Multi-resonance mapped streaming: 2N channels (res{k}_err/res{k}_corr).
                 from .hw_sync_scan import multires_channel_names
-                hw = self._get_multi_track_hw()
+                hw = self._get_tracking_hw()
                 nslots = int(getattr(hw, 'nslots', 2)) if hw is not None else 2
                 channel_names = multires_channel_names(nslots)
                 self._scan_data.initialize_data_arrays(channel_names)
@@ -1050,18 +1071,18 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
 
             # For CONTINUOUS_FREQ_TRACK mode, validate lock and update zero-crossing
             if mode == ScanMode.CONTINUOUS_FREQ_TRACK:
-                tracking_logic = self._odmr_frequency_tracking_logic()
+                tracking_logic = self._tracking_logic()
                 if tracking_logic is None:
                     self.log.error("Tracking logic not available. Cannot resume.")
                     return
 
                 # Validate lock is re-enabled
-                if not tracking_logic.lock_enabled:
+                if not tracking_logic.tracking_active:
                     self.log.error("Lock not enabled. Re-enable tracking in ODMR Tracking GUI before resuming.")
                     return
 
                 # Get current zero-crossing (may have changed after re-locking)
-                new_zero_crossing = tracking_logic.zero_crossing_frequency
+                new_zero_crossing = tracking_logic.resonance_frequencies[0]
                 if new_zero_crossing is None:
                     self.log.error("No zero-crossing frequency. Perform ODMR fit before resuming.")
                     return
@@ -1312,14 +1333,8 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
             if self._lock_status_timer is not None:
                 self._lock_status_timer.stop()
 
-            # Restore stream mode to 'demod' (error signal) for normal tracking GUI use
-            tracking_logic = self._odmr_frequency_tracking_logic()
-            if tracking_logic is not None:
-                try:
-                    tracking_logic.set_stream_mode('demod')
-                    self.log.debug("Restored tracking stream mode to 'demod'")
-                except Exception as e:
-                    self.log.debug(f"Could not restore stream mode: {e}")
+            # Back to streaming the demodulated error
+            self._set_monitor_stream_input('demod')
 
             # Reset tracking state
             self._paused_due_to_lock_loss = False

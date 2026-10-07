@@ -31,7 +31,7 @@ class DataProcessingMixin:
     The parent class must provide:
     - _time_series_logic: Connector to time series logic
     - _odmr_logic: Connector to ODMR logic
-    - _odmr_frequency_tracking_logic: Connector to tracking logic
+    - _tracking_logic: Connector to the ODMR tracking logic
     - _scan_data: MotorScanData instance
     - _scan_state: Current ScanState
     - _active_scan_mode: Current scan mode value
@@ -206,13 +206,13 @@ class DataProcessingMixin:
         if self._active_scan_mode != ScanMode.CONTINUOUS_FREQ_TRACK.value:
             return
 
-        tracking_logic = self._odmr_frequency_tracking_logic()
+        tracking_logic = self._tracking_logic()
         if tracking_logic is None:
             return
 
         # Get current lock status
         try:
-            lock_enabled = tracking_logic.lock_enabled
+            lock_enabled = tracking_logic.tracking_active
         except Exception as e:
             self.log.warning(f"Could not read lock status: {e}")
             return

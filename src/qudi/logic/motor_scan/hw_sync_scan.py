@@ -439,7 +439,7 @@ class HwSyncScanMixin:
         self._scan_module = None
 
     # ---- multi-resonance (KDC_HW_SYNC_MULTIRES) data path -----------------------
-    # The multi-resonance tracker (redpitaya_odmr_lock, MultiResonanceTrackingInterface)
+    # The tracker (redpitaya_odmr_lock, OdmrTrackingInterface)
     # owns the continuous LO-hop loop + self-describing MARKED stream. A mapped 2D scan
     # keeps ALL the shared geometry/motion/trigger logic below and only swaps the data
     # source: instead of the scan module's single demod stream we (a) ask the tracker
@@ -450,9 +450,9 @@ class HwSyncScanMixin:
         sd = getattr(self, '_scan_data', None)
         return sd is not None and sd.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES
 
-    def _get_multi_track_hw(self):
-        """The connected MultiResonanceTrackingInterface hardware, or None."""
-        conn = getattr(self, '_multi_track_hw', None)
+    def _get_tracking_hw(self):
+        """The connected OdmrTrackingInterface hardware, or None."""
+        conn = getattr(self, '_tracking_hw', None)
         if conn is None:
             return None
         try:
@@ -470,19 +470,19 @@ class HwSyncScanMixin:
         """
         sd = self._scan_data
         motor = self._motor_hardware()
-        hw = self._get_multi_track_hw()
+        hw = self._get_tracking_hw()
         if sd is None or motor is None or hw is None:
             self.log.error("KDC_HW_SYNC_MULTIRES setup failed: missing scan_data / "
-                           "motor / multi_track_hw connector. Connect the multi-"
-                           "resonance tracking hardware and start its stream first.")
+                           "motor / tracking_hw connector. Connect the tracking "
+                           "hardware and start its stream first.")
             return False
         if not getattr(hw, 'nslots', 0):
-            self.log.error("KDC_HW_SYNC_MULTIRES: multi_track_hw reports 0 slots.")
+            self.log.error("KDC_HW_SYNC_MULTIRES: tracking_hw reports 0 slots.")
             return False
         if not bool(getattr(hw, 'trace_stream_active', False)):
             self.log.error(
-                "KDC_HW_SYNC_MULTIRES needs the multi-resonance trace stream. In the "
-                "Multi-Resonance ODMR Tracking GUI, configure tracking and click "
+                "KDC_HW_SYNC_MULTIRES needs the tracking trace stream. In the "
+                "ODMR Tracking GUI, configure tracking and click "
                 "Start Stream. Start Tracking is optional (lock-on and open-loop "
                 "motor scans are both supported).")
             return False
@@ -536,7 +536,7 @@ class HwSyncScanMixin:
 
     def _hw_sync_multires_drain(self):
         """Drain new triplet words + x/y markers from the tracker."""
-        hw = self._get_multi_track_hw()
+        hw = self._get_tracking_hw()
         if hw is None:
             return
         try:
@@ -565,7 +565,7 @@ class HwSyncScanMixin:
         returned traces are then indexed from 0 at ``w_lo``. Marked-series is
         fresh-only and per-sample self-labelled, so slicing the words is exact.
         """
-        hw = self._get_multi_track_hw()
+        hw = self._get_tracking_hw()
         if hw is None or not self._hw_word_chunks:
             return None
         words = np.concatenate(self._hw_word_chunks)
@@ -731,7 +731,7 @@ class HwSyncScanMixin:
         if not getattr(self, '_hw_sync_active', False):
             return
         self._hw_sync_active = False
-        hw = self._get_multi_track_hw()
+        hw = self._get_tracking_hw()
         if hw is not None:
             try:
                 hw.enable_position_markers(False)

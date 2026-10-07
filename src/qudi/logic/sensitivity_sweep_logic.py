@@ -104,8 +104,8 @@ class SensitivitySweepLogic(LogicBase):
 
     _odmr_logic = Connector(name='odmr_logic', interface='OdmrLogic')
     _time_series_logic = Connector(name='time_series_logic', interface='TimeSeriesReaderLogic')
-    _odmr_lock_hw = Connector(
-        name='odmr_lock_hw', interface='OdmrFreqLockInterface', optional=True)
+    _tracking_hw = Connector(
+        name='tracking_hw', interface='OdmrTrackingInterface', optional=True)
 
     # =========================================================================
     # Config Options
@@ -298,9 +298,9 @@ class SensitivitySweepLogic(LogicBase):
     @QtCore.Slot(dict, dict, dict)
     def _filter_capabilities(self):
         """Lock-in filters of the loaded FPGA image, from the lock hardware."""
-        lock_hw = self._odmr_lock_hw()
+        lock_hw = self._tracking_hw()
         if lock_hw is None:
-            raise ValueError('Filter selection requires the odmr_lock_hw connector')
+            raise ValueError('Filter selection requires the tracking_hw connector')
         return lock_hw.get_filter_capabilities()
 
     def configure_sweep(self,
@@ -1113,11 +1113,11 @@ class SensitivitySweepLogic(LogicBase):
                     self.log.info('Stream input set to "demod"')
 
             # The lock-in filter belongs to the frequency-lock hardware.
-            lock_hw = self._odmr_lock_hw()
+            lock_hw = self._tracking_hw()
             if lock_hw is None:
                 if self._stream_parameters.get('filter_sweep'):
-                    raise RuntimeError('Cannot apply comparison filter: odmr_lock_hw not connected')
-                self.log.warning('odmr_lock_hw not connected - lock-in filters not configured')
+                    raise RuntimeError('Cannot apply comparison filter: tracking_hw not connected')
+                self.log.warning('tracking_hw not connected - lock-in filters not configured')
                 return
 
             # The implemented Smith model explicitly represents the compiled
@@ -1188,10 +1188,10 @@ class SensitivitySweepLogic(LogicBase):
     def _disable_tracking_safely(self) -> None:
         """Best-effort safe state used after every comparison condition."""
         try:
-            lock_hw = self._odmr_lock_hw()
+            lock_hw = self._tracking_hw()
             if lock_hw is not None:
                 lock_hw.enable_lock(False)
-                lock_hw.clear()
+                lock_hw.clear_integrators()
         except Exception as e:
             self.log.warning('Could not return frequency tracker to its disabled state: %s', e)
 
@@ -1236,15 +1236,14 @@ class SensitivitySweepLogic(LogicBase):
     def _configure_tracking_condition(self, condition: Dict[str, Any],
                                       signed_slope: float):
         """Apply one open/conventional/Smith condition and return its hardware."""
-        lock_hw = self._odmr_lock_hw()
+        lock_hw = self._tracking_hw()
         if lock_hw is None:
             raise RuntimeError(
-                'tracking comparison requested but odmr_lock_hw is not connected')
+                'tracking comparison requested but tracking_hw is not connected')
 
         lock_hw.enable_lock(False)
-        if hasattr(lock_hw, 'prepare_legacy_single_resonance'):
-            lock_hw.prepare_legacy_single_resonance()
-        lock_hw.clear()
+        lock_hw.enable_channel_selection(False)   # resonance 0 live, no hopping
+        lock_hw.clear_integrators()
 
         algorithm = condition['controller_algorithm']
         if algorithm == 'disabled':
@@ -1262,7 +1261,7 @@ class SensitivitySweepLogic(LogicBase):
         lock_hw.set_max_correction_hz(max_correction)
         lock_hw.set_bandwidth(
             float(condition['controller_bandwidth_hz']), abs(float(signed_slope)))
-        lock_hw.clear()
+        lock_hw.clear_integrators()
         lock_hw.enable_lock(True)
         return lock_hw
 

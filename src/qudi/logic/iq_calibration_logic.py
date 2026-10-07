@@ -786,7 +786,7 @@ class IQCalibrationLogic(LogicBase):
 
             # Ensure calibration is performed with a single IF tone.
             #
-            # The RedPitaya fgen3 supports 3 simultaneous components; calibration must use only one.
+            # The RedPitaya ifsynth supports 3 simultaneous components; calibration must use only one.
             # We enforce and verify the microwave module's "single" mode so its `set_cw()` call
             # configures only one IF component on the RedPitaya.
             set_multi_frequency_mode = getattr(mw, 'set_multi_frequency_mode', None)

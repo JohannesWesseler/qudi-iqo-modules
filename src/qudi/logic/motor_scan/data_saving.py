@@ -565,7 +565,7 @@ class DataSavingMixin:
                 if times is None or err is None or corr is None:
                     # Backward-compatible fallback for scan-data objects created
                     # before finalization began snapshotting the reconstruction.
-                    hw = self._get_multi_track_hw()
+                    hw = self._get_tracking_hw()
                     reconstructed = (
                         hw.reconstruct_mapped_traces(words)
                         if hw is not None and words.size else None)

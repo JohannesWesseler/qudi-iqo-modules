@@ -73,7 +73,7 @@ class TestWideFilters(unittest.TestCase):
                                          fir_bypass_ch1=True)
                 logic = Mock()
                 logic._stream_parameters = emitted[0]
-                logic._odmr_lock_hw.return_value = _lock_hw(lockin)
+                logic._tracking_hw.return_value = _lock_hw(lockin)
                 SensitivitySweepLogic._configure_lock_in_filters(logic)
                 self.assertEqual(lockin.filter_select_ch1, name)
                 self.assertFalse(lockin.fir_bypass_ch1)
@@ -111,7 +111,7 @@ class TestWideFilters(unittest.TestCase):
         logic._generate_parameter_combinations = MethodType(
             SensitivitySweepLogic._generate_parameter_combinations, logic)
         logic._filter_capabilities = MethodType(SensitivitySweepLogic._filter_capabilities, logic)
-        lock_hw = logic._odmr_lock_hw.return_value
+        lock_hw = logic._tracking_hw.return_value
         sweep = {'power': [-10], 'f_mod': [15260, 20000, 30000], 'f_dev': [100]}
         stream = {'fir_filter_bandwidth': '10kHz_minphase_2048', 'tracking_modes': ['open_loop']}
         lock_hw.get_filter_capabilities.return_value = {'10kHz_minphase': True}

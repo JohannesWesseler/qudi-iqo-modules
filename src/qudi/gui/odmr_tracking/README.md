@@ -1,474 +1,118 @@
-# ODMR Frequency Tracking Module
+# ODMR Tracking
 
-Extended ODMR module with automatic frequency lock and tracking capabilities for tracking drifting NV center resonances.
+ODMR scanning plus hardware frequency tracking of one or two resonances on the
+Red Pitaya (pyrpl ODMR image).
 
-## Overview
+| Module | File |
+|---|---|
+| GUI `OdmrTrackingGui` (extends `OdmrGui`) | `gui/odmr_tracking/odmr_tracking_gui.py` |
+| Logic `OdmrTrackingLogic` (extends `OdmrLogic`) | `logic/odmr_tracking_logic.py` |
+| Interface `OdmrTrackingInterface` | `interface/odmr_tracking_interface.py` |
+| Hardware `RedPitayaOdmrLockHardware` | `hardware/redpitaya/redpitaya_odmr_lock.py` |
 
-The ODMR Frequency Tracking module **inherits all functionality** from the standard ODMR module and adds hardware-based frequency locking features using PyRPL's FPGA-based lock. This allows automatic tracking of resonance frequency drift in real-time.
+N = 1 and N = 2 use the same modules and the same FPGA path:
 
-## Architecture
+- **N = 1**: the IF sits on resonance 0's zero crossing; resonance 0 stays live
+  and the controller corrects it continuously.
+- **N = 2**: the LO hops between the resonances (constant IF, two-point jump
+  list); each resonance has its own SSB calibration slot, demodulation chain
+  and integrator, frozen while the other one is live.
 
-```
-OdmrFrequencyTrackingLogic (inherits from OdmrLogic)
-    └─ Inherits: ODMR scanning, CW control, data storage, fitting framework
-    └─ Adds: Linear fit extraction, lock control, error signal streaming
-    └─ Uses: TimeSeriesReaderLogic for buffered streaming (via TSR pattern)
+## Workflow
 
-OdmrTrackingGui (inherits from OdmrGui)
-    └─ Inherits: All ODMR controls (scan, CW, menu, toolbar, fit dock)
-    └─ Adds: Fit Controls Dock, Lock Controls Dock, Stream Mode Dock
-    └─ Note: Time-series visualization delegated to Time Series GUI
-```
+1. Select N in *Tracking Mode*.
+2. For each resonance: drag the pale region onto the feature, *Use Region i as
+   scan range*, *Start Scan*; drag the darker fit window onto the linear part
+   and click *Fit Res i* (zero crossing and discriminator slope).
+3. Set f_m, demodulation phase (*← HW* reads the phase set in hardware),
+   controller (*Integral* or *PI* with zero ratio), bandwidth and correction
+   limit; for N = 2 also dwell and settle time. Click *Configure Tracking*.
+4. *Start Stream* / *Start Tracking*, see below.
+5. *Save Measurement* saves the ODMR scan and the tracking data.
 
-## Files
+The error-signal polarity is set from the IF sideband on *Configure Tracking*.
+A new ODMR scan stops tracking and the stream first.
 
-**GUI files (this directory):**
-- **`odmr_tracking_gui.py`**: Main GUI module, extends standard ODMR GUI with tracking features
-- **`tracking_control_dockwidget.py`**: Legacy dock widget (not used in current implementation)
-- **`config_example.yaml`**: Example configuration (see updated config below)
-- **`README.md`**: This documentation
+## Lock and stream
 
-**Logic module:**
-- **`qudi-iqo-modules/src/qudi/logic/odmr_frequency_tracking_logic.py`**
+*Start/Stop Tracking* (controller) and *Start/Stop Stream* (high-rate traces)
+are independent:
 
-**Hardware interface and implementation:**
-- **`qudi-iqo-modules/src/qudi/interface/odmr_freq_lock_interface.py`** - Abstract interface
-- **`qudi-iqo-modules/src/qudi/hardware/redpitaya/redpitaya_odmr_lock.py`** - PyRPL wrapper
+| Tracking | Stream | Result |
+|---|---|---|
+| off | off | idle |
+| on | off | closed loop (N = 2: hopping runs); low-rate register polling only |
+| off | on | open loop: error traces; the cleared correction stays zero |
+| on | on | closed loop with high-rate error, correction and pre-FIR traces |
 
-## Features
+Low-rate history (register polling, whole session) is collected whenever either
+is on. In N = 2 high-rate data only one resonance is live at a time; the parked
+one is held on the common time axis.
 
-### Inherited from ODMR (via OdmrGui)
-- ✅ All standard ODMR scanning functionality
-- ✅ CW microwave control
-- ✅ Multiple frequency range scanning
-- ✅ Data fitting with various models
-- ✅ Data saving and export
-- ✅ Real-time plotting
-- ✅ Menu bar (File, View, Settings)
-- ✅ Toolbar with start/stop/save controls
-- ✅ Status bar with elapsed time/scans
+## Saved data
 
-### New Frequency Tracking Features
-- **Linear Fit Extraction**: Fit linear slope around resonance for lock configuration
-- **Interactive Fit Region**: Draggable region selector on ODMR plot
-- **Hardware-Based Locking**: PyRPL FPGA integral and PI control modes
-- **Lock Configuration**: Easy setup of bandwidth, zero placement, and control mode
-- **Independent Stream/Lock Control**: Error streaming and frequency lock operate independently
-- **Stream Mode Selection**: Switch between error signal (LSB) and frequency correction (Hz) streaming
-- **Real-Time Monitoring**:
-  - Lock status indicators (locked, saturated, error, correction)
-  - Selectable stream content (error vs correction)
-  - **Time series visualization via separate Time Series GUI** (connects to same TSR)
-- **Dock Widget Interface**:
-  - Fit Controls Dock (fit region, slope results)
-  - Lock Controls Dock (mode, parameters, stream/lock enable/disable)
-  - Stream Mode Dock (input selection: error signal or frequency correction)
+*Save Measurement* writes, under the same name tag as the ODMR scan:
 
-## Lock Implementation Reference
+- `ODMR_tracking_history.dat`: low-rate per-resonance error and correction of the
+  session (host monotonic clock from the engine start).
+- `ODMR_tracking_high_rate.npy` plus `_metadata.txt`: the current rolling
+  high-rate window (FPGA time base from the stream start), error, correction
+  and pre-FIR (CIC) per resonance, with the filter and slope calibration in
+  the metadata.
 
-The frequency lock algorithm (control theory, gain formulas, tuning procedures, register map)
-is documented in the PyRPL project:
+Both can be saved while tracking runs or after it stopped.
 
-**See:** `pyrpl/docs/developer_guide/odmr_freq_lock_implementation.md`
+## Other users of the tracker
 
-This qudi module provides the GUI and integration layer; the actual lock runs on the
-Red Pitaya FPGA via PyRPL's `odmr_freq_lock` hardware module.
+- `motor_scan_logic`:
+  - `CONTINUOUS_FREQ_TRACK` (N = 1): streams the correction while the lock runs,
+    via the `tracking_logic` connector.
+  - `KDC_HW_SYNC_MULTIRES`: 2D maps of every resonance's error and correction,
+    via the `tracking_hw` connector. Needs *Start Stream*; *Start Tracking* is
+    optional (open-loop maps). While the scan owns the stream, *Stop Stream* is
+    refused.
+- `sensitivity_sweep_logic`: open/closed-loop comparisons on resonance 0 via
+  `tracking_hw`.
+- Field logging (`OdmrTrackingLogic.start_field_logging(path)`): one row per
+  resonance visit (time, resonance, mean correction, mean error, samples) for
+  long single-position runs; needs *Start Stream*.
 
-## Usage
-
-### 1. Configuration
-
-Add to your qudi configuration file:
+## Configuration
 
 ```yaml
-hardware:
-    # Red Pitaya ODMR Lock Hardware (wraps PyRPL odmr_freq_lock module)
-    redpitaya_odmr_lock:
-        module.Class: 'redpitaya.redpitaya_odmr_lock.RedPitayaOdmrLockHardware'
-        options:
-            redpitaya_config_name: 'rpy_shared_config'
-            redpitaya_hostname: '10.203.129.28'
-
-    # Red Pitaya Stream Hardware (for error signal streaming)
-    redpitaya_stream:
-        module.Class: 'redpitaya.redpitaya_streaming.RedPitayaStreamingHardware'
-        options:
-            redpitaya_config_name: 'rpy_shared_config'
-            redpitaya_hostname: '10.203.129.28'
-
-logic:
-    # Time series reader logic (handles streaming via TSR pattern)
-    time_series_reader_logic:
-        module.Class: 'time_series_reader_logic.TimeSeriesReaderLogic'
-        options:
-            max_frame_rate: 20
-            channel_buffer_size: 100000
-        connect:
-            streamer: 'redpitaya_stream'
-
-    # ODMR frequency tracking logic
-    odmr_frequency_tracking_logic:
-        module.Class: 'odmr_frequency_tracking_logic.OdmrFrequencyTrackingLogic'
-        options:
-            default_lock_bandwidth: 300      # Hz
-            status_poll_interval: 0.5        # seconds (lock status only)
-        connect:
-            microwave: 'mw_source_synthnv'           # Inherited from OdmrLogic
-            data_scanner: 'redpitaya_finite_sampling' # Inherited from OdmrLogic
-            odmr_lock_hw: 'redpitaya_odmr_lock'      # Lock hardware
-            time_series_logic: 'time_series_reader_logic'  # TSR for streaming
-
 gui:
-    # ODMR Tracking GUI
     odmr_tracking_gui:
         module.Class: 'odmr_tracking.odmr_tracking_gui.OdmrTrackingGui'
         connect:
-            odmr_logic: 'odmr_frequency_tracking_logic'
+            odmr_logic: 'odmr_tracking_logic'
 
-    # Time Series GUI (optional, for real-time data visualization)
-    time_series_gui:
-        module.Class: 'time_series.time_series_gui.TimeSeriesGui'
+logic:
+    odmr_tracking_logic:
+        module.Class: 'odmr_tracking_logic.OdmrTrackingLogic'
+        options:
+            default_scan_mode: 'EQUIDISTANT_SWEEP'
+            num_resonances: 1                 # start value; selectable in the GUI
+            modulation_frequency: 15258.789   # f_m [Hz]
+            settle_time: 300e-6               # freeze window after each hop [s]
+            dwell_time: 2.0e-3                # live time per resonance [s] (N = 2)
+            scan_settling_time: 100e-6        # LO settle before the dwell [s]
+            trigger_length: 50e-6             # LO-hop trigger pulse [s]
+            status_poll_interval: 0.2         # s
         connect:
-            time_series_logic: 'time_series_reader_logic'
+            microwave: 'mw_source_synthnv'
+            data_scanner: 'redpitaya_finite_sampling'
+            tracking_hw: 'redpitaya_odmr_lock'
+
+hardware:
+    redpitaya_odmr_lock:
+        module.Class: 'redpitaya.redpitaya_odmr_lock.RedPitayaOdmrLockHardware'
+        options:
+            redpitaya_config_name: 'rpy_shared_config'   # shared pyrpl instance
+            redpitaya_hostname: '10.203.129.28'
+            lock_in_filter_resonance_1: '2kHz_minphase'
+            lock_in_filter_resonance_2: '2kHz_minphase'
+            tracking_algorithm: 'conventional'           # or 'smith_linear' (N = 1)
 ```
 
-**Note:** The time series visualization is handled by a separate Time Series GUI that
-connects to the same `TimeSeriesReaderLogic`. This follows the standard qudi TSR
-pattern for streaming data acquisition.
-
-### 2. Workflow
-
-1. **Start qudi** and activate the ODMR Tracking GUI
-2. **Configure scan** using standard ODMR controls (inherited)
-3. **Start scan** using toolbar button or menu
-4. **Identify resonance** visually on the ODMR plot
-5. **Select fit region**:
-   - Drag the shaded region on the plot, OR
-   - Enter frequency min/max in Fit Controls Dock
-6. **Fit resonance**:
-   - Click "Fit Resonance" button
-   - View slope (LSB/Hz) and R² in dock
-   - Fit curve appears as dashed line on plot
-7. **Configure lock**:
-   - Select mode: Integral (simple) or PI (faster)
-   - Set bandwidth (typical: 100-1000 Hz)
-   - Set Zero Ratio α if using PI mode (typical: 3.0)
-   - Click "Configure" button
-8. **(Optional) Start streaming without lock**:
-   - Select stream mode: Error Signal (LSB) or Frequency Correction (Hz)
-   - Click "Start Stream" to monitor signals without enabling lock
-   - Useful for verification and diagnostics
-9. **Enable lock**:
-   - Click "Enable Lock" button (automatically starts streaming if not running)
-   - Monitor status indicators:
-     - **Locked**: Green = acquired, Red = not locked
-     - **Saturated**: Shows if correction hit limits
-     - **Error [LSB]**: Current demodulated error signal
-     - **Correction [Hz]**: Frequency offset being applied
-10. **Monitor tracking**:
-    - Open Time Series GUI for real-time signal visualization
-    - Adjust bandwidth if needed for stability
-11. **Disable lock**:
-    - Click "Disable Lock" when done (streaming continues)
-    - Click "Stop Stream" to stop data acquisition
-    - Use "Clear" button to reset integrator if saturated
-
-### 3. Lock Tuning
-
-For detailed lock tuning procedures (bandwidth selection, polarity verification, deadband
-configuration, stability analysis), see the PyRPL documentation:
-`pyrpl/docs/developer_guide/odmr_freq_lock_implementation.md` → "Tuning & Commissioning"
-
-**Quick reference:**
-- **Integral Mode**: Start with BW = 300 Hz, increase if stable
-- **PI Mode**: BW = 300 Hz, α = 3.0 (balanced), use for faster response
-- **Stream Modes**: Error Signal (LSB) for diagnostics, Frequency Correction (Hz) for drift monitoring
-
-### 4. Independent Stream/Lock Operation
-
-The module supports **independent control** of streaming and locking:
-
-**Use Cases**:
-1. **Stream-only**: Monitor error signal without enabling lock (diagnostics, verification)
-2. **Lock-only**: Enable lock (streaming starts automatically for lock operation)
-3. **Both**: Stream and lock operate together (normal tracking operation)
-
-**Control Flow**:
-- Stream can start/stop without affecting lock state
-- Lock automatically starts streaming if not running (required for operation)
-- Stopping lock does NOT stop streaming (allows continued monitoring)
-
-## Implementation Details
-
-### Logic Module (`odmr_frequency_tracking_logic.py`)
-
-Key methods:
-
-#### `fit_resonance(freq_min, freq_max)`
-Performs linear fit on ODMR scan data within specified range.
-- Uses parent's `signal_data` and `frequency_data`
-- Returns dict with slope, R², fit curve
-- Emits `sigFitCompleted` signal to GUI
-
-#### `configure_lock(bandwidth_hz, slope_lsb_per_hz)`
-Configures integral-only lock mode via hardware interface.
-
-#### `configure_lock_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)`
-Configures PI lock mode. For control theory details (gain formulas, zero placement),
-see PyRPL documentation.
-
-#### `set_stream_mode(mode)`
-Set streaming mode: 'error' or 'correction'.
-- Cannot change while streaming is active
-- Controls what signal is streamed to Time Series plot
-
-#### `start_error_stream()` / `stop_error_stream()`
-Start/stop error signal streaming independently of lock.
-- Allows monitoring without enabling lock
-- Lock automatically starts streaming if needed
-
-#### `start_tracking()` / `stop_tracking()`
-Enable/disable frequency lock.
-- Automatically starts streaming if not active (required for lock)
-- Stopping lock does NOT stop streaming
-- Starts/stops status polling QTimer
-
-#### `clear_integrator()`
-Reset lock integrator to zero.
-- Useful when lock is saturated
-- Does not disable lock
-- Calls hardware interface `clear()`
-
-### GUI Module (`odmr_tracking_gui.py`)
-
-**Inherited from OdmrGui:**
-- All scan control widgets
-- CW control widget
-- Fit dock widget (hidden in tracking mode)
-- Menu bar and toolbar
-- Settings dialog
-- Plot widget
-
-**Added in OdmrTrackingGui:**
-- Fit region overlay (LinearRegionItem)
-- Fit curve overlay (PlotDataItem)
-- Fit Controls Dock (fit range, button, results)
-- Lock Controls Dock (mode, parameters, buttons, status)
-- Stream Mode Dock (input selection: error signal or frequency correction)
-- Stream mode radio buttons (Error Signal / Frequency Correction)
-- Independent Start/Stop Stream buttons
-- Independent Enable/Disable Lock buttons
-
-**Key overrides:**
-- `restore_default_view()`: Adds tracking docks to window layout
-- `_hide_unused_parent_elements()`: Hides ODMR fit dock and matrix plot
-
-**Note:** Time series visualization is delegated to the Time Series GUI which connects
-to the same `TimeSeriesReaderLogic`. The Stream Mode Dock provides a hint about this.
-
-### Hardware Interface
-
-**OdmrFreqLockInterface** (abstract):
-Defines required methods for lock hardware. See `odmr_freq_lock_interface.py` for the
-full interface specification.
-
-**RedPitayaOdmrLockHardware** (implementation):
-- Wraps PyRPL `odmr_freq_lock` module
-- Manages PyRPL instance via resource manager
-- For hardware constraints and register details, see PyRPL documentation
-
-## Dock Widget Layout
-
-Default layout after `restore_default_view()`:
-
-```
-┌────────────────────────────────────────────────────────┐
-│ Menu Bar: File | View | Settings                       │
-├────────────────────────────────────────────────────────┤
-│ Toolbar: [Start] [Stop] [Resume] [Save] [CW]          │
-├────────────────────────────────────────────────────────┤
-│  ┌──────────────────────┐  ┌─────────────────────┐    │
-│  │                      │  │ [Fit] [Lock] [Mode] │    │  ← Tabbed docks
-│  │   ODMR Plot          │  ├─────────────────────┤    │
-│  │   (with fit region   │  │ Fit Controls        │    │
-│  │    and fit curve)    │  │ Freq Min:           │    │
-│  │                      │  │ Freq Max:           │    │
-│  │                      │  │ [Fit Resonance]     │    │
-│  │                      │  │ Slope: --           │    │
-│  │                      │  │ R²: --              │    │
-│  │                      │  └─────────────────────┘    │
-│  │                      │  ┌─────────────────────┐    │
-│  │                      │  │ Lock Controls       │    │
-│  │                      │  │ ○ Integral ○ PI     │    │
-│  │                      │  │ BW: 300 Hz          │    │
-│  │                      │  │ Zero Ratio (α): 3.0 │    │
-│  │                      │  │ [Configure] [Clear] │    │
-│  │                      │  │ Stream: [Start/Stop]│    │
-│  └──────────────────────┘  │ Lock: [Enable/Dis]  │    │
-│                            │ Locked: OFF         │    │
-│                            │ Saturated: --       │    │
-│                            │ Error [LSB]: --     │    │
-│                            │ Correction [Hz]: -- │    │
-│                            └─────────────────────┘    │
-│                            ┌─────────────────────┐    │
-│                            │ Stream Mode         │    │
-│                            │ ○ Error Signal (LSB)│    │
-│                            │ ○ Freq Corr (Hz)    │    │
-│                            │ Tip: Use Time Series│    │
-│                            │ GUI to view data    │    │
-│                            └─────────────────────┘    │
-├────────────────────────────────────────────────────────┤
-│ Status Bar: Elapsed Time: 0:00:00 | Scans: 0          │
-└────────────────────────────────────────────────────────┘
-```
-
-**Note:** The Fit Controls, Lock Controls, and Stream Mode docks are tabbed on the
-right side. Time series visualization is handled by the separate Time Series GUI
-which connects to the same TimeSeriesReaderLogic instance.
-
-## Troubleshooting
-
-**GUI won't activate**:
-- Check connector name is `odmr_logic` (standard OdmrGui connector)
-- Verify tracking logic implements OdmrLogic interface (via inheritance)
-
-**Fit button does nothing**:
-- Ensure ODMR scan has completed at least once
-- Check fit range is within scan range
-- Verify fit range has at least 2 data points
-
-**Lock won't enable**:
-- Run fit first to extract slope
-- Click "Configure" before "Enable Lock"
-- Check PyRPL connection and odmrfreqlock module availability
-- Verify IQ demodulator is configured in PyRPL
-
-**Lock won't acquire**:
-- Check error signal polarity (may need to adjust in PyRPL)
-- Verify fit range selection (should be on slope, not at dip center)
-- Try increasing bandwidth
-- Check that demodulation frequency matches FM modulation
-
-**Lock saturates immediately**:
-- Click "Clear" to reset integrator
-- Check fit range and slope are correct
-- Reduce bandwidth
-- Verify error signal is near zero before enabling
-
-**Error signal not updating**:
-- Click "Start Stream" to begin data acquisition
-- Open Time Series GUI to view streaming data
-- Check `time_series_logic` connector is configured correctly
-- Verify scan module is in streaming mode in PyRPL
-- Check that IQ demodulator output is routed to scan module
-
-**Cannot change stream mode**:
-- Stream mode can only be changed when streaming is stopped
-- Click "Stop Stream" first, then change mode
-- Mode selection radio buttons are disabled while streaming
-
-## Multi-resonance tracking data export
-
-In `MultiResonanceOdmrTrackingGui`, the inherited **Save Measurement** action saves
-the ODMR scan and the available tracking traces under the same name tag. Tracking
-data can be saved while tracking is active or after it has been stopped.
-
-The tracking export contains simultaneous error and frequency-correction columns
-on one common elapsed-time axis. The number of columns follows the selected mode:
-
-- N=1: elapsed time, resonance 0 error, resonance 0 correction
-- N=2: elapsed time, resonance 0 error/correction, resonance 1 error/correction
-
-Two tracking products are written when high-rate streaming is enabled:
-
-- `ODMR_tracking_history.dat`: retained low-rate register-poll history, suitable
-  for long-duration drift tracking.
-- `ODMR_tracking_high_rate.npy` plus its `_metadata.txt` sidecar: the full-resolution
-  current rolling high-rate window. Load the array with `numpy.load`; column names
-  and acquisition settings are recorded in the sidecar.
-
-Low-rate elapsed time is measured from the hopping/acquisition engine start using a
-monotonic host clock. High-rate elapsed time is measured from each explicit stream
-start using the FPGA sample count and retains its stream-session offset when the
-rolling window discards old samples. Both wall-clock start references are included
-in the metadata. For readability, the live GUI rebases the newest rolling window to
-the fixed `0..Window` x-axis, like the Time Series GUI; this is display-only and does
-not alter the elapsed timestamps written to disk. In N=2
-high-rate data only one resonance is live during a hop dwell; the parked resonance is
-zero-order held on the common time grid, as recorded in the file metadata.
-
-## Independent multi-resonance lock and stream control
-
-`MultiResonanceOdmrTrackingGui` has separate **Start/Stop Tracking** and
-**Start/Stop Stream** controls after **Configure Tracking** has completed. The four
-supported operating states are:
-
-- Lock off, stream off: idle.
-- Lock on, stream off: FPGA tracking and N=2 hopping continue; only low-rate status
-  polling is collected.
-- Lock off, stream on: open-loop measurement. The oscillator and N=2 hopping run,
-  but the FPGA frequency lock is explicitly disabled. The stream carries the
-  demodulated error and correction fields on the same time grid; after a fresh
-  open-loop start, the cleared/disabled correction is normally zero.
-- Lock on, stream on: closed-loop high-rate error and correction acquisition.
-
-Starting or stopping either control does not change the other. In particular,
-stopping the stream does not stop the N=2 hop FSM while tracking remains enabled,
-and disabling tracking leaves an active open-loop stream running.
-
-### Motor-scan integration
-
-`KDC_HW_SYNC_MULTIRES` consumes the same simultaneous error/correction stream and
-temporarily adds encoder-position markers to it. Configure tracking and click
-**Start Stream** before starting this motor-scan mode. **Start Tracking** is optional:
-
-- tracking + streaming produces closed-loop error and correction maps;
-- streaming alone produces an open-loop error map and a normally zero correction map.
-
-The motor scan refuses to start without the stream instead of creating empty maps.
-While it owns the position-marker stream, **Stop Stream** is rejected; stopping the
-motor scan restores the ordinary unmarked stream and leaves the pre-existing lock
-and stream states running. For N resonances, both `res{k}_err` (LSB) and
-`res{k}_corr` (Hz) are binned and saved. With **Save full traces** selected, the
-per-bin traces, faithful triplet stream, marker indices, reconstructed common time
-axis, and both quantities for every resonance are also saved.
-
-## Development Status
-
-**Current Status**: ✅ **COMPLETE AND OPERATIONAL**
-
-**Implemented**:
-- [x] Inheritance-based architecture (Logic extends OdmrLogic, GUI extends OdmrGui)
-- [x] Interactive fit region selection on plot
-- [x] Linear fitting with slope extraction
-- [x] Integral and PI lock mode configuration with zero placement
-- [x] Independent stream and lock control
-- [x] Stream mode selection (error signal vs frequency correction)
-- [x] Lock status monitoring (locked, saturated, error, correction)
-- [x] Hardware abstraction via interface
-- [x] PyRPL integration via resource manager
-- [x] StatusVar persistence for user settings
-- [x] Complete dock widget layout (Fit, Lock, Stream Mode)
-- [x] TimeSeriesReaderLogic integration for streaming (TSR pattern)
-
-**Architecture Notes**:
-- Time series visualization is delegated to the separate Time Series GUI
-- Streaming uses TSR pattern: Logic → TSR Logic → Streamer Hardware
-- Lock status polling skipped during active streaming to avoid TCP conflicts
-
-**Future Enhancements**:
-- [ ] Embedded time series plot in tracking GUI (optional)
-- [ ] Auto-calibration (polarity detection, slope measurement)
-- [x] Multi-resonance tracking export (simultaneous error/correction time series)
-- [ ] Advanced diagnostics (PSD, Allan variance)
-- [ ] Unit tests
-
-## License
-
-Copyright (c) 2021, the qudi developers.
-
-LGPL v3 - See main qudi license file.
-
-## Contact
-
-For questions or contributions, refer to the main qudi-core repository.
+Lock bandwidth, controller, correction limit, demodulation phase and the fit
+regions are kept as status variables between sessions.
