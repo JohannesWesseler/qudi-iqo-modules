@@ -87,7 +87,7 @@ class MotorScanLogic(HwSyncScanMixin,
 
 | Mixin | Responsibility |
 |-------|----------------|
-| `HwSyncScanMixin` | KDC trigger setup, FPGA marker-stream drain, marker reconstruction |
+| `HwSyncScanMixin` | KDC trigger setup, reading the Red Pitaya data stream and position markers, marker reconstruction |
 | `ContinuousLineScanMixin` | Continuous line-by-line state machine |
 | `MotorControlMixin` | Homing, manual movement, position sampling |
 | `DataProcessingMixin` | Stream callbacks, ODMR fitting, line binning |
@@ -277,7 +277,7 @@ Per line:
 2. Configure the fast-axis KDC "At Position Steps" trigger for that line's bin
    boundaries. A leading throwaway pulse absorbs the first-pulse drop observed
    on hardware.
-3. Drain demod samples and x/y marker rings on every poll, including inter-line
+3. Read new samples and x/y markers on every poll, including inter-line
    motion.
 4. Sweep the fast axis continuously.
 5. Reconstruct the row from x-marker sample indices.
@@ -303,8 +303,8 @@ This section describes the legacy software-binned continuous modes
 (`CONTINUOUS_STREAM` and `CONTINUOUS_FREQ_TRACK`). `KDC_HW_SYNC` still uses the
 line state machine for motion orchestration, but it does **not** use the position
 sampling buffer, `sigNewRawData`, or `_bin_line_data()` for its primary data
-assignment. It drains the pyrpl marker stream directly and slices by FPGA sample
-indices instead.
+assignment. It reads samples and position markers from its own Red Pitaya
+data-stream subscription and slices by sample indices instead.
 
 ### Concept
 
@@ -477,20 +477,20 @@ samples to `stream_data_raw[channel][point_idx]`.
 
 ## KDC hardware-sync marker path
 
-`KDC_HW_SYNC` uses `pyrpl.hardware_modules.scan` marker streaming instead of the
-time-series callback. The Red Pitaya scan module is put into marker-stream mode
-with `mapped_stream_start(input_source=hw_sync_channel)`, which enables the
-stream ring and marker capture in the FPGA. The scan drains:
+`KDC_HW_SYNC` reads the Red Pitaya Region-11 data streamer instead of the
+time-series callback. `redpitaya_data_instream.begin_scan_stream(input_source=
+hw_sync_channel)` opens a subscription to the data source (`fir` for `demod`,
+`correction` for `ftw_corr`) and the `x_position`/`y_position` events of the
+KDC trigger inputs. The scan reads:
 
-- demod or `ftw_corr` samples via `mapped_stream_read()`;
+- samples via `mapped_stream_read()`;
 - fast-axis/bin marker indices via `read_x_markers()`;
 - slow-axis/line marker indices via `read_y_markers()`.
 
-All three are in one absolute sample-index space. The FPGA writes the current
-stream sample counter into the marker ring on each captured KDC trigger edge, so
-the marker value itself is the slice boundary in the continuous demod array.
-Push streaming NaN-fills dropped sample ranges, preserving this absolute index
-alignment even if the PC stalls.
+All three are in one sample-index space: a marker value `m` means sample `m` is
+the first sample at or after the trigger edge (from the events' FPGA
+timestamps). Lost samples are NaN, which keeps the indices aligned even if the
+PC stalls.
 
 ### Trigger roles
 
@@ -524,13 +524,21 @@ markers are missing, bunched, or produce empty lines, finalize keeps the live
 software-sequenced map and logs that the slow-axis boundary guarantee was not
 complete for that scan.
 
-### Stream handover
+### Independent subscriptions
 
-The Red Pitaya has one stream ring and one sample counter. If the time-series GUI
-or frequency-tracking monitor is already reading the stream, `KDC_HW_SYNC` asks
-`redpitaya_data_instream.begin_scan_stream()` to hand ownership to the marker
-scan and expose a non-stealing tap for the live display. `end_scan_stream()`
-stops marker mode and restores the standalone monitor stream.
+The data streamer multiplexes subscriptions, so the scan's subscription runs
+alongside the time-series monitor; `end_scan_stream()` closes only the scan's.
+
+### Multi-resonance maps (`KDC_HW_SYNC_MULTIRES`)
+
+While the ODMR tracking engine hops the LO between N resonances, the scan opens
+a recording on the tracking hardware (`tracking_hw.open_recording()`), reads it
+on every poll (`read_recording()`: new events and x/y marker indices) and
+reconstructs 2N fresh-only traces (`reconstruct_recording()`: error and
+correction per resonance, NaN while a resonance is not live), each binned into
+its own map. The recording is independent of the tracking GUI's display stream
+and of field logging. Start the engine first (Start Stream or Start Tracking in
+the ODMR Tracking GUI).
 
 ## Data storage
 

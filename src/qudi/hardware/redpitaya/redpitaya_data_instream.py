@@ -156,13 +156,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._sample_rate = 0.0
         self._current_stream_input = 'demod'  # Current input: 'demod' or 'ftw_corr'
 
-        # KDC_HW_SYNC handover state: the board streams ONE quantity at a time, so a
-        # marker-mode scan must take over this single stream. begin_scan_stream()
-        # remembers the monitor stream here and end_scan_stream() restores it.
+        # KDC_HW_SYNC motor scan: its own data-streamer subscription
+        # (begin_scan_stream), independent of the monitor stream.
         self._scan_active = False
-        self._scan_resume = False
-        self._scan_resume_input = 'demod'
-        self._scan_tap = None        # display tap into the scan's feed (fan-out)
         self._scan_reader = None
         self._scan_data_source = 'fir'
         # Marker indices returned by the reader but not yet requested by the scan.
@@ -359,7 +355,7 @@ class RedPitayaDataInStream(DataInStreamInterface):
             self._current_stream_input = input_mode
 
             if self._running:
-                if not self._scan_active and self._data_streamer is not None:
+                if self._data_streamer is not None:
                     source = 'fir' if input_mode == 'demod' else 'correction'
                     self._data_streamer.update_subscription(self._rx, (source,))
                     # The reader starts a new sample grid for the new source.
@@ -510,22 +506,13 @@ class RedPitayaDataInStream(DataInStreamInterface):
             if self.module_state() == 'locked':
                 self.module_state.unlock()
 
-    # ----- KDC_HW_SYNC stream handover ------------------------------------------
-    # The Red Pitaya streams ONE quantity at a time (single data3 ring, single
-    # free-running sample counter selected by input_select). A marker-mode motor
-    # scan therefore cannot run a *second* stream alongside this monitor stream --
-    # doing so resets the shared sample counter under the monitor and corrupts both
-    # (the bug that OOM'd the GUI). Instead the scan asks this single owner to hand
-    # the stream over: the scan becomes the sole socket reader in marker mode, and
-    # this module switches its own read path to a non-stealing *tap* on the scan's
-    # feed -- so a live time-trace keeps showing the SAME samples the scan is
-    # binning, with no second stream. end_scan_stream() restores the standalone
-    # monitor. The FPGA frequency lock is unaffected throughout (it runs in
-    # hardware and does not depend on the stream).
+    # ----- KDC_HW_SYNC motor-scan subscription -----------------------------------
+    # The data streamer multiplexes subscriptions, so the scan reads its own
+    # samples and x/y position events while the monitor stream keeps running.
 
     @property
     def scan_active(self) -> bool:
-        """True while a KDC_HW_SYNC scan owns the stream (monitor reads via a tap)."""
+        """True while a KDC_HW_SYNC scan subscription is open."""
         return self._scan_active
 
     def begin_scan_stream(self, input_source='ftw_corr', ring_bytes=0, coalesce_us=0):

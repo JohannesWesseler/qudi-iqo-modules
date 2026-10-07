@@ -80,19 +80,17 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
     # ODMR tracking logic (odmr_tracking_logic), for CONTINUOUS_FREQ_TRACK.
     _tracking_logic = Connector(interface='LogicBase', name='tracking_logic',
                                 optional=True)
-    # Shared Red Pitaya stream owner. When connected, KDC_HW_SYNC routes the board's
-    # single push stream through this owner (begin/end_scan_stream) so a marker-mode
-    # scan cleanly takes over from / restores the monitor stream instead of starting
-    # a competing second stream. Optional: without it the scan falls back to grabbing
-    # the pyrpl scan module directly (headless tests).
+    # Red Pitaya data stream (redpitaya_stream). KDC_HW_SYNC opens its own
+    # subscription on it (begin/end_scan_stream); the scan also selects what the
+    # time-series monitor shows. Required for KDC_HW_SYNC.
     _streamer = Connector(interface='DataInStreamInterface', name='streamer',
                           optional=True)
     # Tracking hardware (redpitaya_odmr_lock). Required only for the
-    # KDC_HW_SYNC_MULTIRES mode: the tracker owns the acquisition engine and the
-    # trace stream, and this logic asks it to add x/y markers and to drain and
-    # reconstruct the per-resonance traces for spatial binning. The user configures
-    # and starts the trace stream in the ODMR Tracking GUI; the FPGA lock may
-    # independently be on (closed loop) or off (open loop).
+    # KDC_HW_SYNC_MULTIRES mode: the tracker runs the acquisition engine, and this
+    # logic records the per-resonance traces and x/y markers through its own
+    # recording for spatial binning. The user configures and starts the engine in
+    # the ODMR Tracking GUI; the FPGA lock may independently be on (closed loop)
+    # or off (open loop).
     _tracking_hw = Connector(interface='OdmrTrackingInterface',
                              name='tracking_hw', optional=True)
 
@@ -377,16 +375,7 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
     def _set_monitor_stream_input(self, input_mode):
         """Select what the monitor stream (redpitaya_stream) carries: 'demod'
         (demodulated error) or 'ftw_corr' (frequency correction)."""
-        streamer = None
-        try:
-            streamer = self._streamer()
-        except Exception:
-            pass
-        if streamer is None:
-            try:
-                streamer = self._time_series_logic()._streamer()
-            except Exception:
-                streamer = None
+        streamer = self._streamer()
         if streamer is None or not hasattr(streamer, 'set_stream_input'):
             self.log.warning('No stream module to set the input to %s', input_mode)
             return
@@ -882,10 +871,10 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
-                if not bool(getattr(hw, 'trace_stream_active', False)):
-                    message = ('KDC_HW_SYNC_MULTIRES needs Start Stream in the '
-                               'ODMR Tracking GUI; Start Tracking '
-                               'is optional.')
+                if not bool(getattr(hw, 'tracking_engine_active', False)):
+                    message = ('KDC_HW_SYNC_MULTIRES needs the tracking engine: '
+                               'Start Stream (open loop) or Start Tracking in the '
+                               'ODMR Tracking GUI.')
                     self.log.error(message)
                     self.sigScanStatusMessage.emit(message)
                     self._scan_state = ScanState.IDLE

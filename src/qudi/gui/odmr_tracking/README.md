@@ -68,14 +68,15 @@ Both can be saved while tracking runs or after it stopped.
   - `CONTINUOUS_FREQ_TRACK` (N = 1): streams the correction while the lock runs,
     via the `tracking_logic` connector.
   - `KDC_HW_SYNC_MULTIRES`: 2D maps of every resonance's error and correction,
-    via the `tracking_hw` connector. Needs *Start Stream*; *Start Tracking* is
-    optional (open-loop maps). While the scan owns the stream, *Stop Stream* is
-    refused.
+    via the `tracking_hw` connector. Needs the engine (*Start Stream* for
+    open-loop maps or *Start Tracking*); the scan reads its own recording, so
+    *Stop Stream* stays available.
 - `sensitivity_sweep_logic`: open/closed-loop comparisons on resonance 0 via
   `tracking_hw`.
 - Field logging (`OdmrTrackingLogic.start_field_logging(path)`): one row per
   resonance visit (time, resonance, mean correction, mean error, samples) for
-  long single-position runs; needs *Start Stream*.
+  long single-position runs; reads its own recording while the engine runs
+  (*Start Stream* or *Start Tracking*) and closes when the engine stops.
 
 ## Configuration
 

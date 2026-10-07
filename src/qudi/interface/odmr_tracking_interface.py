@@ -11,7 +11,9 @@ hardware provides:
     live resonance's demodulated error and correcting the IF synthesizer,
   - an acquisition engine: for N > 1 a hardware sequencer hops the LO between
     the resonances; an optional trace stream delivers error, correction and
-    pre-FIR (CIC) traces of every resonance on one time axis.
+    pre-FIR (CIC) traces of every resonance on one time axis for display, and
+    independent recordings deliver the same data losslessly to consumers such
+    as 2D motor scans and field loggers.
 N = 1 is the single-resonance case of the same hardware (no hopping).
 
 The per-resonance SSB calibration and the LO jump list live on the
@@ -35,7 +37,7 @@ qudi. If not, see <https://www.gnu.org/licenses/>.
 """
 
 from abc import abstractmethod
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from qudi.core.module import Base
 
 
@@ -277,66 +279,58 @@ class OdmrTrackingInterface(Base):
         pass
 
     # =========================================================================
-    # Direct stream drain: 2D motor scans and continuous field logging
+    # Recordings: 2D motor scans, field logging, sensitivity measurements
     # =========================================================================
-    # While a mapped scan or a field logger owns the drain, read_traces does
-    # not drain; the owner is the only caller of read_stream_words.
-
-    @property
-    @abstractmethod
-    def position_markers_active(self) -> bool:
-        """Whether a mapped motor scan owns the trace stream and its markers."""
-        pass
+    # Each recording is an independent, lossless subscription to the tracking
+    # stream. Recordings do not affect read_traces or each other.
 
     @property
     @abstractmethod
     def stream_sample_rate(self) -> float:
-        """Trace stream sample rate (Hz)."""
-        pass
-
-    @property
-    @abstractmethod
-    def stream_words_per_sample(self) -> int:
-        """Elements of read_stream_words per sample."""
+        """Sample rate (Hz) of the reconstructed traces."""
         pass
 
     @abstractmethod
-    def enable_position_markers(self, enable: bool) -> None:
-        """Record x/y position markers on the running trace stream (raises
-        without an active stream, so a scan cannot acquire empty maps)."""
+    def open_recording(self) -> int:
+        """Start a recording (error, CIC, correction, live resonance and x/y
+        position events) and return its handle."""
         pass
 
     @abstractmethod
-    def read_position_markers(self) -> Tuple[Any, Any]:
-        """New (x, y) markers since the last call, as sample indices into the
-        reconstructed traces (two int64 arrays)."""
-        pass
-
-    @abstractmethod
-    def read_stream_words(self) -> Any:
-        """New raw stream records since the last call (destructive drain)."""
-        pass
-
-    @abstractmethod
-    def reconstruct_mapped_traces(self, words: Any) -> Dict[str, Any]:
+    def read_recording(self, handle: int) -> Dict[str, Any]:
         """
-        Decode accumulated stream records into per-resonance traces without
-        hold: NaN while a resonance is parked, frozen or lost, so a per-bin
-        nanmean sees only its own live samples.
+        Events recorded since the last call.
 
         Returns:
-            dict with 'err', 'cic' (N, T) LSB, 'corr_hz' (N, T) Hz,
-            'times' (T,) s and 'sample_rate' (Hz).
+            dict with 'events' (opaque array; concatenate successive reads for
+            reconstruct_recording) and 'x_markers', 'y_markers' (int64): the new
+            position markers, as sample indices into
+            reconstruct_recording(all events of this recording). Raises if the
+            stream receiver failed.
         """
         pass
 
     @abstractmethod
-    def begin_field_drain(self) -> None:
-        """Hand the stream drain to a continuous field logger (needs an active
-        stream; refused while a mapped scan owns it)."""
+    def close_recording(self, handle: int) -> Dict[str, Any]:
+        """Stop a recording (idempotent); returns transport/FPGA statistics."""
         pass
 
     @abstractmethod
-    def end_field_drain(self) -> None:
-        """Return the drain to read_traces (idempotent)."""
+    def reconstruct_recording(self, events: Any,
+                              nslots: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Decode recorded events into per-resonance traces without hold: NaN
+        while a resonance is parked, frozen or lost, so a per-bin nanmean sees
+        only its own live samples.
+
+        Args:
+            events: concatenated 'events' of read_recording.
+            nslots: number of resonances (default: the running engine's N).
+
+        Returns:
+            dict with 'err', 'cic' (N, T) LSB, 'corr_hz' (N, T) Hz, 'times'
+            (T,) s, 'ticks' (T,) FPGA clock ticks, 'clock_hz', 'dead' (T,),
+            'sample_rate' (Hz), 'x_markers', 'y_markers' (sample indices) and
+            'event_counts' {source: count}.
+        """
         pass

@@ -540,7 +540,7 @@ class DataSavingMixin:
             return
 
         # Multi-resonance mode has one cut trace per resonance/quantity plus the
-        # faithful self-describing triplet stream. Keep all of them: selecting just
+        # raw stream events. Keep all of them: selecting just
         # the first channel would silently discard either correction or demod error.
         if sd.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES:
             saved_channels = 0
@@ -554,9 +554,11 @@ class DataSavingMixin:
                         traces, allow_pickle=True)
                 saved_channels += 1
 
-            words = np.asarray(getattr(sd, 'hw_stream_words', []), dtype=np.float64)
-            if words.size:
-                np.save(os.path.join(scan_folder, 'hw_sync_stream_words.npy'), words)
+            # Raw timestamped stream events (structured array; decode with
+            # pyrpl DataStreamer.reconstruct_tracking).
+            events = getattr(sd, 'hw_stream_events', None)
+            if events is not None and len(events):
+                np.save(os.path.join(scan_folder, 'hw_sync_stream_events.npy'), events)
             try:
                 times = getattr(sd, 'hw_multires_times', None)
                 err = getattr(sd, 'hw_multires_err', None)
@@ -567,8 +569,10 @@ class DataSavingMixin:
                     # before finalization began snapshotting the reconstruction.
                     hw = self._get_tracking_hw()
                     reconstructed = (
-                        hw.reconstruct_mapped_traces(words)
-                        if hw is not None and words.size else None)
+                        hw.reconstruct_recording(
+                            events, nslots=getattr(sd, 'hw_multires_nslots', None))
+                        if hw is not None and events is not None and len(events)
+                        else None)
                     if reconstructed is not None:
                         times = reconstructed['times']
                         err = reconstructed['err']
@@ -591,7 +595,7 @@ class DataSavingMixin:
                 self.log.warning("Could not save reconstructed multi-resonance "
                                  "faithful traces: %s", e)
             self.log.info("KDC_HW_SYNC_MULTIRES raw saved: %d per-channel cut-trace "
-                          "arrays + triplet stream/markers in %s",
+                          "arrays + stream events/markers in %s",
                           saved_channels, scan_folder)
             return
 

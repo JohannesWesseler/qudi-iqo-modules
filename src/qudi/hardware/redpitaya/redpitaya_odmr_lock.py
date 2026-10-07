@@ -98,35 +98,21 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         self._single_slot_no_hop = False
         self._nslots = 2
         self._trace_events = None
-        self._pending_xmarkers = np.empty(0, dtype=np.int64)
-        self._pending_ymarkers = np.empty(0, dtype=np.int64)
-        self._marker_x_seen = 0
-        self._marker_y_seen = 0
-        self._trace_ticks = np.array([], dtype=np.int64)
-        self._trace_steps = np.array([], dtype=np.int64)
-        # Number of complete stream records removed from the front of the rolling
-        # buffer.  This preserves an elapsed-since-stream-start time axis.
+        # Number of FIR grid samples removed from the front of the rolling
+        # display buffer. This preserves an elapsed-since-stream-start time axis.
         self._trace_sample_offset = 0
-        # One structured Region-11 event per returned array element.
-        self._stream_words_per_sample = 1
-        # Runtime rolling-window size in WORDS for the high-rate display buffer
-        # (settable live via set_trace_window_seconds; initialized from the
-        # max_trace_samples ConfigOption in on_activate).
+        # Rolling-window size (events) of the display buffer (settable live via
+        # set_trace_window_seconds; initialized from max_trace_samples).
         self._trace_window_words = 2_000_000
         self._configured_lock_in_filters = ['2kHz_minphase', '2kHz_minphase']
-        # 2D motor-scan takeover: while True the motor scan owns the physical stream
-        # drain (read_stream_words), so read_traces must NOT also drain (word theft).
-        self._mapped_scan_active = False
-        # Single-position field-trace takeover: while True the tracking logic's
-        # continuous field logger owns the physical drain (read_stream_words), so
-        # read_traces must NOT also drain (same word-theft guard as the mapped scan).
-        self._field_drain_active = False
-        # Serializes stream-touching ops (drain + restart) across the two caller
-        # threads: the tracking logic's read_traces poll and the motor-scan logic's
-        # read_stream_words / enable_position_markers restart. Qudi hardware methods
-        # run on the caller's thread (no auto-marshalling), so without this a restart
-        # could replace the StreamClient mid-read.
+        # Serializes start/stop of the display subscription against read_traces.
+        # Qudi hardware methods run on the caller's thread.
         self._stream_lock = threading.RLock()
+        # Recordings: handle -> {'reader', 'origin', 'held'}. Each recording is
+        # its own data-streamer subscription, so consumers never share a reader.
+        self._recordings = {}
+        self._next_recording = 1
+        self._recording_lock = threading.RLock()
 
     def on_activate(self):
         """Connect to PyRPL and get the controller, reference, channel and scan modules."""
@@ -161,7 +147,6 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
             raise RuntimeError(
                 'tracking_algorithm="smith_linear" requires the matching Smith FPGA image')
         self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
-        self._stream_words_per_sample = 1
 
         # Resonance 1 is demodulated in lock-in chain 0, resonance 2 in chain 1;
         # configure both explicitly.
@@ -222,13 +207,17 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
                  linear_gain if name == '2kHz_linear' else minphase_gain
                  for name in self._configured_lock_in_filters]
         return {
-            'stream_words_per_sample': int(self._stream_words_per_sample),
             'filters': tuple(self._configured_lock_in_filters[:self._nslots]),
             'fir_dc_gain_from_cic_lsb': tuple(gains[:self._nslots]),
         }
 
     def on_deactivate(self):
         """Disable lock and disconnect."""
+        for handle in list(self._recordings):
+            try:
+                self.close_recording(handle)
+            except Exception as e:
+                self.log.warning(f'Could not close recording {handle}: {e}')
         try:
             if self._tracking_active:
                 self.stop_engine()
@@ -463,16 +452,6 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         return bool(self._streaming_traces)
 
     @property
-    def position_markers_active(self) -> bool:
-        """True while a mapped motor scan owns the physical stream drain."""
-        return bool(self._mapped_scan_active)
-
-    @property
-    def field_drain_active(self) -> bool:
-        """True while a single-position field logger owns the physical stream drain."""
-        return bool(self._field_drain_active)
-
-    @property
     def stream_sample_rate(self) -> float:
         """Aggregate demod stream rate [Hz], reported by the FPGA image."""
         return float(self._stream_sample_rate_hz)
@@ -491,31 +470,6 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
     def ftw_per_hz(self) -> float:
         """Generator frequency-tuning words per hertz for this image."""
         return (2.0 ** 32) / self.fpga_clock_hz
-
-    @property
-    def stream_words_per_sample(self) -> int:
-        """Number of 32-bit words in one synchronized stream record."""
-        return int(self._stream_words_per_sample)
-
-    def begin_field_drain(self) -> None:
-        """Hand the physical stream drain to a single-position field logger.
-
-        Mirrors the 2D mapped-scan takeover: while active, ``read_traces`` (the 5 Hz
-        GUI poll) stops draining so the field logger's ``read_stream_words`` sees every
-        word. The logger still feeds the display buffer (read_stream_words does), so
-        the tracking GUI's live traces keep updating. Requires an active trace stream.
-        """
-        with self._stream_lock:
-            if not self._streaming_traces:
-                raise RuntimeError('Start the trace stream before field logging.')
-            if self._mapped_scan_active:
-                raise RuntimeError('A mapped 2D scan already owns the stream drain.')
-            self._field_drain_active = True
-
-    def end_field_drain(self) -> None:
-        """Return the drain to the GUI poll (idempotent)."""
-        with self._stream_lock:
-            self._field_drain_active = False
 
     def get_demod_phase(self) -> float:
         """Demodulation phase [deg] of the reference oscillator. Scans and
@@ -587,10 +541,6 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         # ensure the LO-hop trigger reaches the Windfreak (DIO7_P, inverted)
         if self._nslots > 1:
             self._configure_hop_trigger_pin()
-        # reset the high-rate trace buffers
-        self._trace_ticks = np.array([], dtype=np.int64)
-        self._trace_steps = np.array([], dtype=np.int64)
-        self._trace_sample_offset = 0
         self._streaming_traces = False
 
         self._single_slot_no_hop = self._nslots == 1
@@ -652,23 +602,26 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
             self._tracking_active = False
             self._streaming_traces = False
             self._single_slot_no_hop = False
-            self._mapped_scan_active = False
             self._odmr.release_sequencer(self.module_name)
-        self.log.info('Tracking engine stopped')
+        if self._recordings:
+            self.log.info('Tracking engine stopped; %d recording(s) stay open until '
+                          'their owners close them.', len(self._recordings))
+        else:
+            self.log.info('Tracking engine stopped')
+
+    # Sources of the display subscription and of every recording.
+    _TRACE_SOURCES = ('fir', 'cic', 'correction', 'step', 'window',
+                      'x_position', 'y_position')
+
+    def _subscribe_traces(self):
+        return self._streamer.subscribe(self._TRACE_SOURCES, poll_us=50,
+                                        ring_bytes=32 << 20, coalesce_us=500)
 
     def _start_trace_stream_hardware(self) -> None:
-        """Start/reset only the push-stream side of the tracking engine."""
-        self._trace_ticks = np.array([], dtype=np.int64)
-        self._trace_steps = np.array([], dtype=np.int64)
+        """Start/reset the display subscription of the tracking engine."""
         self._trace_sample_offset = 0
-        self._pending_xmarkers = np.empty(0, dtype=np.int64)
-        self._pending_ymarkers = np.empty(0, dtype=np.int64)
         self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
-        self._stream_reader = self._streamer.subscribe(
-            ('fir', 'cic', 'correction', 'step', 'x_position',
-             'y_position', 'window'), poll_us=50,
-            ring_bytes=32 << 20, coalesce_us=500)
-        self._stream_words_per_sample = 1
+        self._stream_reader = self._subscribe_traces()
         self._streaming_traces = True
 
     def start_trace_stream(self) -> None:
@@ -685,19 +638,11 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
     def stop_trace_stream(self) -> None:
         """Stop traces without changing hopping or the FPGA lock state."""
         with self._stream_lock:
-            # Check ownership under the same lock used by enable_position_markers;
-            # otherwise a concurrent GUI stop could slip between marker takeover
-            # and the stream restart.
             if not self._streaming_traces:
                 return
-            if self._mapped_scan_active:
-                raise RuntimeError(
-                    'Cannot stop the trace stream while a KDC_HW_SYNC_MULTIRES motor '
-                    'scan owns its position-marker data.')
             self._streamer.unsubscribe(self._stream_reader)
             self._stream_reader = None
             self._streaming_traces = False
-            self._mapped_scan_active = False
         self.log.info('Trace stream stopped.')
 
     def read_traces(self) -> Optional[Dict[str, Any]]:
@@ -718,10 +663,11 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         if not (self._tracking_active and self._streaming_traces):
             return None
 
-        if not self._mapped_scan_active and not self._field_drain_active:
-            with self._stream_lock:
-                new_events = self._stream_reader.read_events()
-            self._append_event_trace(new_events)
+        with self._stream_lock:
+            if self._stream_reader is None:
+                return None
+            new_events = self._stream_reader.read_events()
+        self._append_event_trace(new_events)
         if self._trace_events is None or not self._trace_events.size:
             return None
         rec = self._streamer.reconstruct_tracking(
@@ -776,13 +722,7 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
             self._trace_events = np.concatenate((self._trace_events, events))
         if self._trace_events is None:
             return
-        # A mapped motor scan consumes marker indices incrementally. Retain its
-        # complete event history until the scan ends so trimming cannot move the
-        # marker arrays underneath the per-axis ``seen`` cursors.
-        if self._mapped_scan_active:
-            return
-        # The old option counted words. Preserve approximately the same memory
-        # bound by interpreting it as a maximum number of event records here.
+        # max_trace_samples bounds the number of buffered event records.
         keep = max(1, int(self._trace_window_words))
         if self._trace_events.size > keep:
             dropped = self._trace_events.size - keep
@@ -812,96 +752,98 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
                        s, self._trace_window_words)
 
     # =========================================================================
-    # 2D motor-scan composition: x/y position markers on the running stream
+    # Recordings: independent, lossless stream subscriptions
     # =========================================================================
-    def enable_position_markers(self, enable: bool) -> None:
-        """Enable/disable KDC x/y position-marker capture on the running stream.
+    def open_recording(self) -> int:
+        """Open an independent recording of the tracking stream (error, CIC,
+        correction, live resonance and x/y position events) and return its
+        handle. Independent of the display stream and of other recordings."""
+        self._require_active()
+        reader = self._subscribe_traces()
+        with self._recording_lock:
+            handle = self._next_recording
+            self._next_recording += 1
+            self._recordings[handle] = {
+                'reader': reader, 'origin': None,
+                'held': np.empty(0, dtype=self._streamer.EVENT_DTYPE)}
+        self.log.debug('Recording %d opened.', handle)
+        return handle
 
-        Position events are always available Region-11 sources. Restarting this
-        subscriber establishes a fresh local marker origin without resetting the
-        shared packetizer or disturbing other subscribers and does not perturb the
-        controller or hop sequencer.
-        """
-        if self._scan is None:
-            self.log.warning('enable_position_markers: rp.scan unavailable.')
-            return
-        with self._stream_lock:
-            if enable and not (self._tracking_active and self._streaming_traces):
-                raise RuntimeError(
-                    'KDC_HW_SYNC_MULTIRES needs an active tracking trace stream. '
-                    'Configure tracking and click Start Stream first; Start Tracking is '
-                    'optional (open-loop error mapping is supported).')
-            if enable:
-                # Stop the tracking poll's drain FIRST (so it can't read the
-                # StreamClient we are about to replace), then restart with markers.
-                self._mapped_scan_active = True
-                self._restart_mapped_stream(xy_markers=True)
-            else:
-                self._restart_mapped_stream(xy_markers=False)
-                self._mapped_scan_active = False
-        self.log.info('KDC x/y position markers %s (stream restarted, aligned).',
-                      'ENABLED (2D mapped scan)' if enable else 'disabled')
-
-    def _restart_mapped_stream(self, xy_markers: bool) -> None:
-        """Replace this subscriber to establish a fresh local marker origin."""
-        elapsed = 0
-        if self._trace_events is not None:
-            elapsed = int(np.count_nonzero(
-                self._trace_events['source'] == self._streamer.SOURCE_IDS['fir']))
-        self._streamer.unsubscribe(self._stream_reader)
-        self._trace_events = np.empty(0, dtype=self._streamer.EVENT_DTYPE)
-        self._stream_reader = self._streamer.subscribe(
-            ('fir', 'cic', 'correction', 'step', 'x_position',
-             'y_position', 'window'), poll_us=50,
-            ring_bytes=32 << 20, coalesce_us=500)
-        self._trace_sample_offset += elapsed
-        self._pending_xmarkers = np.empty(0, dtype=np.int64)
-        self._pending_ymarkers = np.empty(0, dtype=np.int64)
-        self._marker_x_seen = 0
-        self._marker_y_seen = 0
-
-    def read_position_markers(self) -> Tuple[np.ndarray, np.ndarray]:
-        """New (x, y) position markers since the last call, as sample indices."""
-        empty = (np.array([], dtype=np.int64), np.array([], dtype=np.int64))
-        if not self._streaming_traces:
-            return empty
-        result = (self._pending_xmarkers, self._pending_ymarkers)
-        self._pending_xmarkers = np.empty(0, dtype=np.int64)
-        self._pending_ymarkers = np.empty(0, dtype=np.int64)
-        return result
-
-    def read_stream_words(self) -> np.ndarray:
-        """New raw self-describing stream words (destructive drain)."""
-        if not self._streaming_traces:
-            return np.empty(0, dtype=self._streamer.EVENT_DTYPE)
+    def _recording(self, handle: int) -> Dict[str, Any]:
         try:
-            with self._stream_lock:
-                events = self._stream_reader.read_events()
-        except Exception as e:
-            self.log.warning('read_stream_words event drain failed: %s', e)
-            return np.empty(0, dtype=self._streamer.EVENT_DTYPE)
-        self._append_event_trace(events)
-        if self._trace_events.size:
-            rec = self._streamer.reconstruct_tracking(
-                self._trace_events, nslots=self._nslots,
-                interval=self._sample_period_cycles)
-            self._pending_xmarkers = rec['x_position'][self._marker_x_seen:]
-            self._pending_ymarkers = rec['y_position'][self._marker_y_seen:]
-            self._marker_x_seen = rec['x_position'].size
-            self._marker_y_seen = rec['y_position'].size
-        return events
+            return self._recordings[handle]
+        except KeyError:
+            raise ValueError(f'No open recording {handle!r}') from None
 
-    def reconstruct_mapped_traces(self, words) -> Dict[str, Any]:
-        """Decode accumulated record words -> fresh-only err/corr/CIC traces."""
-        events = np.asarray(words, dtype=self._streamer.EVENT_DTYPE)
+    def read_recording(self, handle: int) -> Dict[str, Any]:
+        """New events of a recording since the last call, plus the x/y markers
+        among them as indices into reconstruct_recording(all events so far)."""
+        rec = self._recording(handle)
+        reader = rec['reader']
+        events = reader.read_events()
+        if reader.error is not None:
+            raise RuntimeError(f'Recording {handle}: stream receiver failed: {reader.error}')
+        x_markers, y_markers = self._recording_markers(rec, events)
+        return {'events': events, 'x_markers': x_markers, 'y_markers': y_markers}
+
+    def _recording_markers(self, rec, events) -> Tuple[np.ndarray, np.ndarray]:
+        """Marker indices with the reconstruct_tracking convention: the first FIR
+        grid point at or after the marker, counted from the recording's first FIR
+        event. Markers that arrive before that event are held until it does."""
+        ids = self._streamer.SOURCE_IDS
+        empty = np.empty(0, dtype=np.int64)
+        if rec['origin'] is None:
+            fir = events['source'] == ids['fir']
+            if np.any(fir):
+                rec['origin'] = int(events['tick'][np.flatnonzero(fir)[0]])
+        is_marker = ((events['source'] == ids['x_position']) |
+                     (events['source'] == ids['y_position']))
+        markers = events[is_marker]
+        if rec['held'].size:
+            markers = np.concatenate((rec['held'], markers))
+            rec['held'] = rec['held'][:0]
+        if rec['origin'] is None:
+            rec['held'] = markers
+            return empty, empty
+        if not markers.size:
+            return empty, empty
+        interval = int(self._sample_period_cycles)
+        index = -((rec['origin'] - markers['tick'].astype(np.int64)) // interval)
+        return (index[markers['source'] == ids['x_position']].astype(np.int64),
+                index[markers['source'] == ids['y_position']].astype(np.int64))
+
+    def close_recording(self, handle: int) -> Dict[str, Any]:
+        """Close a recording; returns its transport and FPGA statistics."""
+        with self._recording_lock:
+            rec = self._recordings.pop(handle, None)
+        if rec is None:
+            return {}
+        stats = {}
+        try:
+            stats = {'transport': rec['reader'].stats(),
+                     'fpga': self._streamer.stats()}
+        finally:
+            self._streamer.unsubscribe(rec['reader'])
+        self.log.debug('Recording %d closed.', handle)
+        return stats
+
+    def reconstruct_recording(self, events, nslots: Optional[int] = None) -> Dict[str, Any]:
+        """Per-resonance traces of recorded events, without hold (NaN while a
+        resonance is parked, frozen or lost)."""
+        events = np.asarray(events, dtype=self._streamer.EVENT_DTYPE)
+        n = int(self._nslots if nslots is None else nslots)
         rec = self._streamer.reconstruct_tracking(
-            events, nslots=self._nslots,
-            interval=self._sample_period_cycles,
+            events, nslots=n, interval=self._sample_period_cycles,
             correction_converter=self._odmr.ftw_to_hz)
         times = ((rec['ticks'] - rec['ticks'][0]).astype(np.float64) /
                  self._fpga_clock_hz
                  if rec['ticks'].size else np.empty(0, dtype=np.float64))
+        ids = self._streamer.SOURCE_IDS
+        counts = {name: int(np.count_nonzero(events['source'] == ids[name]))
+                  for name in self._TRACE_SOURCES}
         return {'err': rec['err'], 'corr_hz': rec['corr'], 'cic': rec['cic'],
                 'times': times, 'dead': rec['dead'],
                 'ticks': rec['ticks'].astype(np.int64), 'clock_hz': self._fpga_clock_hz,
-                'sample_rate': self._stream_sample_rate_hz}
+                'sample_rate': self._stream_sample_rate_hz,
+                'x_markers': rec['x_position'], 'y_markers': rec['y_position'],
+                'event_counts': counts}

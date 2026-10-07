@@ -130,7 +130,7 @@ class TestWideFilters(unittest.TestCase):
         hw = SimpleNamespace(
             _odmr=SimpleNamespace(demod_filter=lambda chain: {'filter': live[chain]}),
             _configured_lock_in_filters=['2kHz_minphase', '2kHz_minphase'],
-            _stream_words_per_sample=4, _nslots=2)
+            _nslots=2)
         result = RedPitayaOdmrLockHardware.get_trace_calibration(hw)
         self.assertEqual(result['filters'], ('6kHz_minphase', '10kHz_minphase'))
         self.assertEqual(result['fir_dc_gain_from_cic_lsb'], (7326 / 2**14,) * 2)

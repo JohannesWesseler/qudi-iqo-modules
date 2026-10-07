@@ -106,6 +106,10 @@ class SensitivitySweepLogic(LogicBase):
     _time_series_logic = Connector(name='time_series_logic', interface='TimeSeriesReaderLogic')
     _tracking_hw = Connector(
         name='tracking_hw', interface='OdmrTrackingInterface', optional=True)
+    # The time-series data stream (redpitaya_stream): the sweep switches it to the
+    # demodulated error before measuring.
+    _streamer = Connector(
+        name='streamer', interface='DataInStreamInterface', optional=True)
 
     # =========================================================================
     # Config Options
@@ -1093,14 +1097,16 @@ class SensitivitySweepLogic(LogicBase):
         self.log.info(f'Configuring lock-in filters: bypass={fir_bypass}, bandwidth={fir_filter_bw}')
 
         try:
-            # Access the streamer hardware through time_series_logic
             ts_logic = self._time_series_logic()
-            streamer = ts_logic._streamer()
+            streamer = self._streamer()
+            if streamer is None:
+                self.log.warning('streamer not connected: the time-series stream '
+                                 'input is not checked')
 
             # CRITICAL: Ensure stream input is set to 'demod' for sensitivity measurements
             # This protects against mode changes from other modules (e.g., ODMR tracking
             # might have switched to 'ftw_corr' mode)
-            if hasattr(streamer, 'set_stream_input') and hasattr(streamer, 'stream_input'):
+            if streamer is not None and hasattr(streamer, 'set_stream_input'):
                 current_mode = streamer.stream_input
                 if current_mode != 'demod':
                     self.log.warning(
@@ -1267,31 +1273,27 @@ class SensitivitySweepLogic(LogicBase):
 
     def _acquire_timestamped_tracking_events(self, closed_loop: bool,
                                               lock_hw=None):
-        """Acquire raw Region-11 events without passing through the display buffer."""
+        """Record timestamped stream events of resonance 0 through the tracking
+        hardware (an independent recording; the display buffer is not involved)."""
+        if lock_hw is None:
+            lock_hw = self._tracking_hw()
+        if lock_hw is None:
+            raise RuntimeError('tracking_hw is not connected')
         ts_logic = self._time_series_logic()
         if ts_logic.module_state() == 'locked':
             ts_logic.stop_reading()
             time.sleep(0.2)
-        streamer = ts_logic._streamer()
-        data_streamer = getattr(streamer, '_data_streamer', None)
-        if data_streamer is None:
-            raise RuntimeError('the configured streamer has no Region-11 data streamer')
 
-        sources = ('fir', 'correction') if closed_loop else ('fir',)
         duration = (float(self._stream_parameters.get('n_time_traces', 32)) *
                     float(self._stream_parameters.get('trace_duration', 1.0)))
-        reader = data_streamer.subscribe(
-            sources=sources,
-            ring_bytes=int(self._stream_parameters.get('stream_ring_bytes', 0)),
-            coalesce_us=int(self._stream_parameters.get('stream_coalesce_us', 0)))
         chunks = []
-        transport_stats = {}
-        fpga_stats = {}
         controller_status_history = []
         started = time.monotonic()
         status_poll_interval = float(
             self._stream_parameters.get('tracking_status_poll_interval_s', 0.2))
         next_status_poll = started
+        handle = lock_hw.open_recording()
+        stats = {}
         try:
             deadline = started + duration
             while time.monotonic() < deadline:
@@ -1299,13 +1301,11 @@ class SensitivitySweepLogic(LogicBase):
                         min(0.05, max(0.0, deadline - time.monotonic())),
                         check_interval=0.05):
                     raise InterruptedError('tracking stream acquisition interrupted')
-                events = reader.read_events()
-                if events.size:
+                events = lock_hw.read_recording(handle)['events']
+                if len(events):
                     chunks.append(events)
-                if reader.error is not None:
-                    raise RuntimeError(f'stream receiver failed: {reader.error}')
                 now = time.monotonic()
-                if closed_loop and lock_hw is not None and now >= next_status_poll:
+                if closed_loop and now >= next_status_poll:
                     try:
                         status = dict(lock_hw.get_status())
                         status['acquisition_time_s'] = now - started
@@ -1316,44 +1316,24 @@ class SensitivitySweepLogic(LogicBase):
                             'read_error': str(e),
                         })
                     next_status_poll = now + max(0.02, status_poll_interval)
-            tail = reader.read_events()
-            if tail.size:
+            tail = lock_hw.read_recording(handle)['events']
+            if len(tail):
                 chunks.append(tail)
-            transport_stats = reader.stats()
-            fpga_stats = data_streamer.stats()
         finally:
-            data_streamer.unsubscribe(reader)
+            stats = lock_hw.close_recording(handle)
 
-        events = (np.concatenate(chunks)
-                  if chunks else np.empty(0, dtype=data_streamer.EVENT_DTYPE))
-        if not events.size:
+        if not chunks:
             raise RuntimeError('no FPGA stream events were received')
+        events = np.concatenate(chunks)
 
-        reconstruction = data_streamer.reconstruct_tracking(
-            events, nslots=1, interval=int(streamer._demod_decimation),
-            correction_converter=streamer.ftw_to_hz)
+        reconstruction = lock_hw.reconstruct_recording(events, nslots=1)
         error_signal = reconstruction['err'][0]
-        correction_hz = reconstruction['corr'][0] if closed_loop else None
-
-        # Single-resonance operation should advertise a live acquisition window.
-        # Retain a diagnostic fallback for images predating that flag so the raw
-        # FIR samples are not discarded merely because a metadata bit is absent.
+        correction_hz = reconstruction['corr_hz'][0] if closed_loop else None
         if error_signal.size and not np.any(np.isfinite(error_signal)):
-            fir_events = data_streamer.select(events, 'fir')
-            fir_ticks = data_streamer.event_ticks(fir_events)
-            origin = int(reconstruction['ticks'][0])
-            fir_index = np.rint(
-                (fir_ticks.astype(np.int64) - origin) /
-                float(streamer._demod_decimation)).astype(np.int64)
-            error_signal = np.full(reconstruction['ticks'].size, np.nan)
-            keep = (fir_index >= 0) & (fir_index < error_signal.size)
-            error_signal[fir_index[keep]] = fir_events['data'][keep]
-            self.log.warning(
-                'FIR live-window flag was absent; used the timestamp grid directly.')
+            raise RuntimeError('the recording has no live resonance-0 FIR samples')
 
-        ticks = reconstruction['ticks']
-        time_s = ((ticks - ticks[0]).astype(np.float64) /
-                  float(data_streamer.timestamp_clock_hz))
+        time_s = reconstruction['times']
+        counts = reconstruction['event_counts']
         diagnostics = {
             'requested_duration_s': duration,
             'wall_duration_s': time.monotonic() - started,
@@ -1363,11 +1343,10 @@ class SensitivitySweepLogic(LogicBase):
             'event_payload_rate_MBps': float(
                 events.size * 12 /
                 max(duration, 1e-12) / 1e6),
-            'fir_event_count': int(data_streamer.select(events, 'fir').size),
-            'correction_event_count': int(
-                data_streamer.select(events, 'correction').size),
-            'transport': json_safe(transport_stats),
-            'fpga': json_safe(fpga_stats),
+            'fir_event_count': int(counts.get('fir', 0)),
+            'correction_event_count': int(counts.get('correction', 0)),
+            'transport': json_safe(stats.get('transport', {})),
+            'fpga': json_safe(stats.get('fpga', {})),
             'controller_status_history': controller_status_history,
         }
         return time_s, error_signal, correction_hz, events, diagnostics

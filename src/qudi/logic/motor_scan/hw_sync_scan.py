@@ -259,8 +259,8 @@ def reconstruct_hw_sync_multires_line(scan_data,
     """Bin one line for ALL res{k}_{err,corr} channels from reconstructed traces.
 
     ``traces`` is the fresh-only per-resonance reconstruction
-    (``{'err': (N,T), 'corr_hz': (N,T)}``) whose sample axis (0..T-1) is the same
-    triplet axis the (triplet-index) x-markers address. Reuses the single-channel
+    (``{'err': (N,T), 'corr_hz': (N,T)}``) whose sample axis (0..T-1) is the
+    sample axis the x-markers address. Reuses the single-channel
     binner per channel so the marker/bin/snake logic stays in one place; the
     warning is logged once (channel 0) to avoid 2N-fold spam.
     """
@@ -339,12 +339,12 @@ class HwSyncScanMixin:
         """Initialize HW-sync buffers/handles. Call from ``__init__``."""
         self._scan_module = None            # redpitaya_stream while a scan stream runs
         self._scan_via_streamer = False
-        # Multi-resonance (KDC_HW_SYNC_MULTIRES) state: the tracker owns the stream,
-        # we drain raw triplet WORDS (reconstructed on the PC into 2N fresh-only
-        # traces) instead of a single demod array.
-        self._hw_word_chunks = []           # list[np.ndarray] - raw triplet words
+        # Multi-resonance (KDC_HW_SYNC_MULTIRES) state: the scan's own recording on
+        # the tracker; its events are reconstructed on the PC into 2N fresh-only
+        # traces instead of a single demod array.
+        self._hw_recording = None           # recording handle on the tracker
+        self._hw_word_chunks = []           # list[np.ndarray] - recorded stream events
         self._hw_multires_nslots = 0        # resonance count for the active mapped scan
-        self._hw_multires_words_per_sample = 3  # legacy default; queried at setup
         self._hw_demod_chunks = []          # list[np.ndarray] - continuous demod
         self._hw_xmarks_flat = np.empty(0, dtype=np.int64)  # absolute x-marker indices
         self._hw_ymarks_flat = np.empty(0, dtype=np.int64)  # absolute y-marker indices (diagnostic)
@@ -439,13 +439,12 @@ class HwSyncScanMixin:
         self._scan_module = None
 
     # ---- multi-resonance (KDC_HW_SYNC_MULTIRES) data path -----------------------
-    # The tracker (redpitaya_odmr_lock, OdmrTrackingInterface)
-    # owns the continuous LO-hop loop + self-describing MARKED stream. A mapped 2D scan
-    # keeps ALL the shared geometry/motion/trigger logic below and only swaps the data
-    # source: instead of the scan module's single demod stream we (a) ask the tracker
-    # to add x/y markers (which restarts + resets its stream for clean alignment), and
-    # (b) drain raw triplet WORDS + markers through the tracker, reconstructing 2N
-    # fresh-only per-resonance traces on the PC and binning each into its own map.
+    # The tracker (redpitaya_odmr_lock, OdmrTrackingInterface) runs the LO-hop
+    # engine. A mapped 2D scan keeps ALL the shared geometry/motion/trigger logic
+    # below and only swaps the data source: it opens its own recording on the
+    # tracker (events + x/y markers), reconstructs 2N fresh-only per-resonance
+    # traces on the PC and bins each into its own map. The tracking GUI's display
+    # stream and other recordings are unaffected.
     def _hw_sync_is_multires(self) -> bool:
         sd = getattr(self, '_scan_data', None)
         return sd is not None and sd.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES
@@ -479,16 +478,13 @@ class HwSyncScanMixin:
         if not getattr(hw, 'nslots', 0):
             self.log.error("KDC_HW_SYNC_MULTIRES: tracking_hw reports 0 slots.")
             return False
-        if not bool(getattr(hw, 'trace_stream_active', False)):
+        if not bool(getattr(hw, 'tracking_engine_active', False)):
             self.log.error(
-                "KDC_HW_SYNC_MULTIRES needs the tracking trace stream. In the "
-                "ODMR Tracking GUI, configure tracking and click "
-                "Start Stream. Start Tracking is optional (lock-on and open-loop "
-                "motor scans are both supported).")
+                "KDC_HW_SYNC_MULTIRES needs the tracking engine. In the "
+                "ODMR Tracking GUI, configure tracking and click Start Stream "
+                "(open loop) or Start Tracking (closed loop).")
             return False
         self._hw_multires_nslots = int(hw.nslots)
-        self._hw_multires_words_per_sample = int(
-            getattr(hw, 'stream_words_per_sample', 3))
 
         # reset drain buffers
         self._hw_word_chunks = []
@@ -502,17 +498,12 @@ class HwSyncScanMixin:
         self._hw_empty_line_streak = 0
         self._hw_empty_line_total = 0
 
-        # Add x/y position markers to the tracker's running MARKED stream. This
-        # restarts + resets the stream (word 0 aligns with marker 0) but leaves the
-        # hop loop + per-slot lock running. Do this before configuring motor outputs,
-        # so a stream race/failure cannot leave a KDC trigger armed after setup aborts.
+        # Open the scan's recording before configuring motor outputs, so a stream
+        # failure cannot leave a KDC trigger armed after setup aborts.
         try:
-            hw.enable_position_markers(True)
+            self._hw_recording = hw.open_recording()
         except Exception as e:
-            self.log.error("Failed to enable multi-resonance position markers: %s", e)
-            return False
-        if not bool(getattr(hw, 'position_markers_active', True)):
-            self.log.error("Multi-resonance hardware did not enter position-marker mode.")
+            self.log.error("Failed to open the multi-resonance recording: %s", e)
             return False
 
         # slow-axis 'In Motion' line-boundary trigger (identical to single-res)
@@ -528,25 +519,23 @@ class HwSyncScanMixin:
                 self.log.warning("Could not configure slow-axis 'In Motion' trigger: %s", e)
 
         self._hw_sync_active = True
-        self.log.info("KDC_HW_SYNC_MULTIRES marker stream started (N=%d, channels=%s).",
+        self.log.info("KDC_HW_SYNC_MULTIRES recording started (N=%d, channels=%s).",
                       self._hw_multires_nslots,
                       multires_channel_names(self._hw_multires_nslots))
         self._hw_sync_warmup_sweep()
         return True
 
     def _hw_sync_multires_drain(self):
-        """Drain new triplet words + x/y markers from the tracker."""
+        """Read new events + x/y markers from the scan's recording."""
         hw = self._get_tracking_hw()
-        if hw is None:
+        if hw is None or getattr(self, '_hw_recording', None) is None:
             return
         try:
-            w = hw.read_stream_words()
+            new = hw.read_recording(self._hw_recording)
+            w = new['events']
             if w is not None and len(w):
-                # Region-11 uses structured timestamped events; the legacy scan
-                # stream uses float words. Preserve whichever representation the
-                # hardware adapter returned.
                 self._hw_word_chunks.append(np.asarray(w))
-            xm, ym = hw.read_position_markers()
+            xm, ym = new['x_markers'], new['y_markers']
             if xm is not None and len(xm):
                 self._hw_xmarks_flat = np.concatenate(
                     [self._hw_xmarks_flat, np.asarray(xm, dtype=np.int64)])
@@ -558,47 +547,32 @@ class HwSyncScanMixin:
 
     def _hw_sync_multires_traces(self, w_lo: Optional[int] = None,
                                  w_hi: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """Reconstruct accumulated words into fresh-only per-resonance traces.
+        """Reconstruct the recorded events into fresh-only per-resonance traces.
 
-        If ``w_lo``/``w_hi`` (sample indices) are given, only that record window
-        is decoded (cheap, for the live per-line map); the
-        returned traces are then indexed from 0 at ``w_lo``. Marked-series is
-        fresh-only and per-sample self-labelled, so slicing the words is exact.
+        If ``w_lo``/``w_hi`` (sample indices) are given, the returned traces are
+        that window, indexed from 0 at ``w_lo``.
         """
         hw = self._get_tracking_hw()
         if hw is None or not self._hw_word_chunks:
             return None
-        words = np.concatenate(self._hw_word_chunks)
-        if words.dtype.names is not None:
-            try:
-                traces = hw.reconstruct_mapped_traces(words)
-            except Exception as e:
-                self.log.warning("KDC_HW_SYNC_MULTIRES reconstruct failed: %s", e)
-                return None
-            if w_lo is None:
-                return traces
-            lo = max(0, int(w_lo))
-            hi = None if w_hi is None else max(lo, int(w_hi))
-            sliced = dict(traces)
-            for key in ('err', 'corr_hz', 'cic'):
-                if key in sliced:
-                    sliced[key] = np.asarray(sliced[key])[:, lo:hi]
-            for key in ('times', 'dead'):
-                if key in sliced:
-                    sliced[key] = np.asarray(sliced[key])[lo:hi]
-            return sliced
-        if w_lo is not None:
-            width = int(self._hw_multires_words_per_sample)
-            a = max(0, width * int(w_lo))
-            b = words.size if w_hi is None else min(words.size, width * int(w_hi))
-            if b <= a:
-                return None
-            words = words[a:b]
+        events = np.concatenate(self._hw_word_chunks)
         try:
-            return hw.reconstruct_mapped_traces(words)
+            traces = hw.reconstruct_recording(events, nslots=self._hw_multires_nslots)
         except Exception as e:
             self.log.warning("KDC_HW_SYNC_MULTIRES reconstruct failed: %s", e)
             return None
+        if w_lo is None:
+            return traces
+        lo = max(0, int(w_lo))
+        hi = None if w_hi is None else max(lo, int(w_hi))
+        sliced = dict(traces)
+        for key in ('err', 'corr_hz', 'cic'):
+            if key in sliced:
+                sliced[key] = np.asarray(sliced[key])[:, lo:hi]
+        for key in ('times', 'dead', 'ticks'):
+            if key in sliced:
+                sliced[key] = np.asarray(sliced[key])[lo:hi]
+        return sliced
 
     def _hw_sync_multires_line_finish(self, line_index: int) -> Dict[str, Any]:
         """Final drain + reconstruct + bin this line for all 2N channels."""
@@ -663,9 +637,8 @@ class HwSyncScanMixin:
         n_lines = sd.get_num_lines()
         # stash faithful hardware dataset for offline re-binning / saving
         try:
-            words = (np.concatenate(self._hw_word_chunks)
-                     if self._hw_word_chunks else np.empty(0, dtype=np.float64))
-            sd.hw_stream_words = words
+            sd.hw_stream_events = (np.concatenate(self._hw_word_chunks)
+                                   if self._hw_word_chunks else None)
             sd.hw_x_markers = xm
             sd.hw_y_markers = ym
             sd.hw_multires_nslots = self._hw_multires_nslots
@@ -727,16 +700,17 @@ class HwSyncScanMixin:
         return diag
 
     def _hw_sync_multires_teardown(self):
-        """Stop x/y markers and disable KDC triggers, leaving stream/lock as found."""
+        """Close the recording and disable KDC triggers, leaving engine/lock as found."""
         if not getattr(self, '_hw_sync_active', False):
             return
         self._hw_sync_active = False
         hw = self._get_tracking_hw()
-        if hw is not None:
+        if hw is not None and getattr(self, '_hw_recording', None) is not None:
             try:
-                hw.enable_position_markers(False)
+                hw.close_recording(self._hw_recording)
             except Exception as e:
-                self.log.warning("Error disabling multires position markers: %s", e)
+                self.log.warning("Error closing the multi-resonance recording: %s", e)
+        self._hw_recording = None
         motor = self._motor_hardware()
         if motor is not None:
             sd = self._scan_data

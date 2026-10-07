@@ -163,9 +163,10 @@ class OdmrTrackingLogic(OdmrLogic):
 
         # continuous per-visit field-trace logging (driven by the status poll, which
         # already runs on the logic thread). start/stop only flip request flags so
-        # they are safe to call from any thread; the actual drain / file I/O / drain-
-        # ownership handoff all happen inside _service_field_logging on the poll.
+        # they are safe to call from any thread; the recording, reduction and file
+        # I/O happen inside _service_field_logging on the poll.
         self._field_log_open = False
+        self._field_recording = None
         self._field_log_path = None
         self._field_log_start_request = False
         self._field_log_stop_request = False
@@ -566,6 +567,10 @@ class OdmrTrackingLogic(OdmrLogic):
         """Stop the engine and channel selection once lock and stream released it."""
         if not self._engine_active:
             return
+        if self._field_log_open:
+            # The log describes the running engine; close it with the engine.
+            self._field_log_stop_request = True
+            self._service_field_logging()
         lock_hw = self._tracking_hw()
         try:
             lock_hw.stop_engine()
@@ -779,8 +784,7 @@ class OdmrTrackingLogic(OdmrLogic):
                 self.sigHighRateTracesUpdated.emit(times, err, corr_hz, cic)
 
         # continuous per-visit field-trace logging shares this poll's cadence and
-        # thread. It owns the physical stream drain while active (read_stream_words),
-        # so the read_traces call above intentionally did not drain when logging.
+        # thread; it reads its own recording.
         self._service_field_logging()
 
     # =========================================================================
@@ -949,8 +953,8 @@ class OdmrTrackingLogic(OdmrLogic):
     # 2D scan maps (fresh-only per-resonance corr_hz / err), reduced per hop-visit with
     # the identical np.nanmean -- so a single-position time trace and a 2D-map pixel are
     # the same operation, one indexed in time and the other in space. Neither the FPGA
-    # lock nor the trace stream is started/stopped here (both stay GUI-owned); logging
-    # only piggybacks on the running stream. B(t) is derived offline as
+    # lock nor the engine is started/stopped here (both stay GUI-owned); logging reads
+    # its own recording of the running engine. B(t) is derived offline as
     # (res1_corr - res0_corr), exactly as the 2D GUI derives the field map.
     @property
     def field_logging_active(self) -> bool:
@@ -963,8 +967,9 @@ class OdmrTrackingLogic(OdmrLogic):
         """Request continuous per-visit field logging to ``<path_prefix>.bin`` (+.json).
 
         Thread-safe: only sets a request flag. The status poll (logic thread) opens the
-        file, takes over the stream drain, and appends per-visit rows. Requires the
-        trace stream to be running (Start Stream in the GUI).
+        file and a recording, and appends per-visit rows. Requires the acquisition
+        engine to be running (Start Stream or Start Tracking in the GUI); it is closed
+        when the engine stops.
         """
         self._field_log_path = str(path_prefix)
         self._field_log_stop_request = False
@@ -972,8 +977,8 @@ class OdmrTrackingLogic(OdmrLogic):
 
     @QtCore.Slot()
     def stop_field_logging(self) -> None:
-        """Request a clean stop: flush the trailing partial visit, close the file, and
-        return the stream drain to the GUI poll. Thread-safe (flag only)."""
+        """Request a clean stop: flush the trailing partial visit, close the file and
+        the recording. Thread-safe (flag only)."""
         self._field_log_stop_request = True
 
     @staticmethod
@@ -1083,11 +1088,11 @@ class OdmrTrackingLogic(OdmrLogic):
                 self._close_field_log(hw)
 
     def _open_field_log(self, hw) -> None:
-        if hw is None or not bool(getattr(hw, 'trace_stream_active', False)):
-            raise RuntimeError('The trace stream is not active; click Start Stream '
-                               'before field logging.')
+        if hw is None or not self._engine_active:
+            raise RuntimeError('The acquisition engine is not running; click Start '
+                               'Stream before field logging.')
         os.makedirs(os.path.dirname(self._field_log_path) or '.', exist_ok=True)
-        hw.begin_field_drain()
+        self._field_recording = hw.open_recording()
         self._field_rate = float(hw.stream_sample_rate)
         self._field_tail = None
         self._field_tick0 = None
@@ -1095,7 +1100,12 @@ class OdmrTrackingLogic(OdmrLogic):
         self._field_written = 0
         self._field_loss_words = 0
         self._field_total_words = 0
-        self._field_file = open(self._field_log_path + '.bin', 'wb')
+        try:
+            self._field_file = open(self._field_log_path + '.bin', 'wb')
+        except Exception:
+            hw.close_recording(self._field_recording)
+            self._field_recording = None
+            raise
         self._field_log_open = True
         self._write_field_metadata()
         self.log.info(f'Field logging started -> {self._field_log_path}.bin '
@@ -1109,7 +1119,7 @@ class OdmrTrackingLogic(OdmrLogic):
         finalized on the next drain."""
         if hw is None or not self._field_log_open:
             return
-        new = hw.read_stream_words()
+        new = hw.read_recording(self._field_recording)['events']
         if new is not None and len(new):
             if self._field_start_wall is None:
                 self._field_start_wall = time.time()
@@ -1120,7 +1130,7 @@ class OdmrTrackingLogic(OdmrLogic):
             records = self._field_tail
         if records is None or not len(records):
             return
-        traces = hw.reconstruct_mapped_traces(records)
+        traces = hw.reconstruct_recording(records)
         err = np.asarray(traces['err'], dtype=np.float64)
         corr = np.asarray(traces['corr_hz'], dtype=np.float64)
         ticks = np.asarray(traces['ticks'], dtype=np.int64)
@@ -1166,10 +1176,12 @@ class OdmrTrackingLogic(OdmrLogic):
         finally:
             self._field_file = None
         try:
-            if hw is not None:
-                hw.end_field_drain()
+            if hw is not None and self._field_recording is not None:
+                hw.close_recording(self._field_recording)
         except Exception as e:
-            self.log.warning(f'Error releasing field drain: {e}')
+            self.log.warning(f'Error closing the field-log recording: {e}')
+        finally:
+            self._field_recording = None
         self._field_log_open = False
         self._write_field_metadata()
         self.log.info(
