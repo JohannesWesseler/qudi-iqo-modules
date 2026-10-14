@@ -312,8 +312,8 @@ def main():
             logic.stop_streaming()
             wait(1)
 
-            # 9. N=1 PI controller at zero ratio 1
-            logic.set_controller('pi', 1.0)
+            # 9. N=1 PI controller at zero ratio 0.2
+            logic.set_controller('pi', 0.2)
             logic.configure_tracking()
             logic.start_streaming()
             logic.start_tracking()
@@ -324,11 +324,12 @@ def main():
             res['closed_loop_n1_pi'] = dict(status=st_pi, traces=tr_pi,
                                             K_Kp=float(odmr.lock.kp_hz_per_lsb) * k)
             log(f'N=1 PI: K*Kp={odmr.lock.kp_hz_per_lsb * k:.2f}, {st_pi[0]} {tr_pi}')
-            # A ringing loop (zero ratio 3) shows a few hundred times the
-            # integral-only error noise; a stable PI loop stays within a few.
+            # An oscillating loop shows a few hundred times the integral-only
+            # error noise, a ringing one (zero ratio 1) about 1.3 times; at 0.2
+            # PI is as quiet as integral control.
             checks['n1_pi_stable'] = (bool(odmr.lock.prop_enable) and
                                       locked(tr_pi[0], slopes[0]) and
-                                      tr_pi[0]['err_std'] < 5 * tr1[0]['err_std'])
+                                      tr_pi[0]['err_std'] < 1.2 * tr1[0]['err_std'])
             logic.stop_tracking()
             logic.stop_streaming()
             logic.set_controller('integral')

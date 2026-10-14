@@ -255,7 +255,7 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
     # =========================================================================
 
     def set_bandwidth(self, bandwidth_hz: float, slope_lsb_per_hz: float,
-                      pi: bool = False, zero_ratio: float = 1.0) -> None:
+                      pi: bool = False, zero_ratio: float = 0.2) -> None:
         """Configure the loop gains (integral-only, or PI if ``pi=True``).
 
         The gains are global (shared by all slots in hardware). With
@@ -385,6 +385,12 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
             'damping_range': (0.5, 1.0),  # Dimensionless
             'max_correction_hz': 62.5e6,  # Half of 125 MHz (Nyquist)
         }
+
+    def measure_slope(self, step_hz: float = 1e3) -> float:
+        """Open-loop discriminator slope of the live resonance [LSB/Hz], after
+        the polarity inversion (> 0: the loop locks here)."""
+        self._require_active()
+        return self._odmr.measure_slope(step_hz=float(step_hz))
 
     def set_max_correction_hz(self, max_correction_hz: float) -> None:
         """Set maximum frequency correction (FTW saturation limit)."""

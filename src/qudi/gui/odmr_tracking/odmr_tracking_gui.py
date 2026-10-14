@@ -65,10 +65,10 @@ class OdmrTrackingGui(OdmrGui):
     _gui_demod_phase = StatusVar('demod_phase_deg', default=0.0)
     _gui_dwell_time = StatusVar('dwell_time', default=1.0e-3)
     _gui_settle_time = StatusVar('settle_time', default=200e-6)
-    _gui_bandwidth = StatusVar('lock_bandwidth', default=300.0)
+    _gui_bandwidth = StatusVar('lock_bandwidth', default=150.0)
     _gui_max_correction = StatusVar('max_correction_hz', default=1.0e6)
     _gui_controller = StatusVar('controller', default='integral')
-    _gui_zero_ratio = StatusVar('zero_ratio', default=1.0)
+    _gui_zero_ratio = StatusVar('zero_ratio', default=0.2)
     _gui_detail_points = StatusVar('detail_points', default=101)
     _gui_trace_window_s = StatusVar('trace_window_s', default=20.0)
 
@@ -311,13 +311,14 @@ class OdmrTrackingGui(OdmrGui):
         self._controller_combo.setToolTip(
             'Integral: zero steady-state error; a drifting resonance is followed '
             'with a lag proportional to the drift rate. PI: adds a proportional term '
-            '(zero at bandwidth / zero ratio) for more phase margin and faster '
-            'acquisition; it does not reduce the drift lag.')
+            '(zero at bandwidth / zero ratio) that damps the loop; with ratio 0.2 it '
+            'allows about 20 % more bandwidth at the same stability margins.')
         self._zero_ratio_spin = QtWidgets.QDoubleSpinBox()
         self._zero_ratio_spin.setRange(0.1, 30.0); self._zero_ratio_spin.setDecimals(2)
         self._zero_ratio_spin.setToolTip(
             'PI zero at bandwidth / zero ratio. The proportional loop gain is '
-            'ratio / sqrt(1 + ratio^2); keep the ratio <= 1, larger values ring.')
+            'ratio / sqrt(1 + ratio^2); 0.2 is robust, 1 and above ring '
+            '(the predicted margins are in the log).')
         self._controller_combo.currentIndexChanged.connect(
             lambda _i: self._zero_ratio_spin.setEnabled(
                 self._controller_combo.currentData() == 'pi'))

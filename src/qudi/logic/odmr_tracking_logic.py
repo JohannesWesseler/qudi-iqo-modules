@@ -91,10 +91,10 @@ class OdmrTrackingLogic(OdmrLogic):
     _demod_phase_deg = StatusVar('demod_phase_deg', default=0.0)
     _fit_ranges = StatusVar('fit_ranges', default=[(2.86e9, 2.88e9), (2.90e9, 2.92e9)])
     _max_correction_hz_sv = StatusVar('max_correction_hz', default=1.0e6)
-    _lock_bandwidth = StatusVar('lock_bandwidth', default=300.0)
+    _lock_bandwidth = StatusVar('lock_bandwidth', default=150.0)
     # 'integral' or 'pi' (zero at bandwidth / zero_ratio)
     _controller = StatusVar('controller', default='integral')
-    _zero_ratio = StatusVar('zero_ratio', default=1.0)
+    _zero_ratio = StatusVar('zero_ratio', default=0.2)
 
     # ---- signals ----
     sigResonanceFitCompleted = QtCore.Signal(int, dict)   # (index, fit_result)
@@ -483,6 +483,8 @@ class OdmrTrackingLogic(OdmrLogic):
         lock_hw.configure_channels(float(self._settle_time), source=channel_source)
         slopes = [self._resonance_slopes[i] for i in range(n) if self._resonance_slopes[i]]
         rep_slope = float(np.mean(slopes)) if slopes else 1.1
+        if n == 1:
+            rep_slope = self._checked_slope(lock_hw.measure_slope(), rep_slope)
         lock_hw.set_bandwidth(float(self._lock_bandwidth), rep_slope,
                               pi=(self._controller == 'pi'),
                               zero_ratio=float(self._zero_ratio))
@@ -499,6 +501,22 @@ class OdmrTrackingLogic(OdmrLogic):
             f'(slope {rep_slope:.3e} LSB/Hz)')
 
     @QtCore.Slot(dict)
+    def _checked_slope(self, measured: float, fitted: float) -> float:
+        """The measured open-loop slope, used for the gains. A falling error
+        signal would push the loop away from the resonance; a slope far from the
+        fit means the fit window or the resonance has moved."""
+        if measured <= 0:
+            raise RuntimeError(
+                f'The error signal falls at the configured frequency (slope '
+                f'{measured:.3g} LSB/Hz): the loop would push away from the resonance. '
+                f'Fit a rising zero crossing, or check the sideband (invert).')
+        if not 1 / 1.5 < measured / fitted < 1.5:
+            self.log.warning(f'Measured slope {measured:.3g} LSB/Hz differs from the fitted '
+                             f'{fitted:.3g} LSB/Hz; the gains use the measured one.')
+        else:
+            self.log.info(f'Measured slope {measured:.3g} LSB/Hz (fit {fitted:.3g})')
+        return float(measured)
+
     def configure_tracking_from_params(self, params: Dict) -> None:
         """Apply GUI parameters and report configuration success explicitly.
 

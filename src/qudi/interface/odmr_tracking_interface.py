@@ -55,7 +55,7 @@ class OdmrTrackingInterface(Base):
 
     @abstractmethod
     def set_bandwidth(self, bandwidth_hz: float, slope_lsb_per_hz: float,
-                      pi: bool = False, zero_ratio: float = 1.0) -> None:
+                      pi: bool = False, zero_ratio: float = 0.2) -> None:
         """
         Set the (global) loop gains for a target bandwidth.
 
@@ -67,8 +67,20 @@ class OdmrTrackingInterface(Base):
             pi: True for PI control, False for integral-only.
             zero_ratio: PI zero at bandwidth_hz / zero_ratio, in [0.1, 30]
                 (PI only). The proportional loop gain is
-                zero_ratio / sqrt(1 + zero_ratio^2); with the filter delay,
-                values above 1 ring.
+                zero_ratio / sqrt(1 + zero_ratio^2) and sets the gain margin
+                against the filter delay: 0.2 is robust, 1 rings.
+        """
+        pass
+
+    @abstractmethod
+    def measure_slope(self, step_hz: float = 1e3) -> float:
+        """
+        Measure the discriminator slope of the live resonance in open loop.
+
+        Steps the IF by +-step_hz around the configured frequency with the lock
+        held. Returns the slope of the controller's error (after the polarity
+        inversion) in LSB/Hz: > 0 means negative feedback, i.e. the loop
+        locks on this zero crossing. The lock must be disabled.
         """
         pass
 
