@@ -502,6 +502,32 @@ class OdmrTrackingLogic(OdmrLogic):
             f'BW={self._lock_bandwidth} Hz, {self._controller} control '
             f'(slope {rep_slope:.3e} LSB/Hz)')
 
+    def recenter_on_tracked(self) -> List[float]:
+        """Move the configured resonance frequencies to where the loop tracks
+        them: fitted + correction (upper sideband; minus for the lower one).
+
+        Call while tracking, before stop_tracking (disabling the lock clears
+        the corrections). The next configure_tracking then measures the slope
+        and sets the IF at the resonance's present position, so a resonance
+        that drifted (e.g. warming under the microwave) since the fit does not
+        detune the slope measurement and the gains. Returns the new
+        frequencies [Hz].
+        """
+        lock_hw = self._tracking_hw()
+        try:
+            sideband = str(getattr(self._microwave(), 'sideband', 'upper')).lower()
+        except Exception:
+            sideband = 'upper'
+        sign = -1.0 if sideband in ('lower', 'lsb') else 1.0
+        n = int(self._num_resonances)
+        for i in range(n):
+            correction = float(lock_hw.get_slot_status(i)['correction_hz'])
+            self._resonance_freqs[i] = float(self._resonance_freqs[i]) + sign * correction
+        freqs = [float(self._resonance_freqs[i]) for i in range(n)]
+        self.log.info(f'Re-centered on the tracked frequencies: '
+                      f'{[round(f / 1e9, 6) for f in freqs]} GHz')
+        return freqs
+
     @QtCore.Slot(dict)
     def _checked_slope(self, measured: float, fitted: float) -> float:
         """The measured open-loop slope, used for the gains. A falling error
@@ -512,6 +538,13 @@ class OdmrTrackingLogic(OdmrLogic):
                 f'The error signal falls at the configured frequency (slope '
                 f'{measured:.3g} LSB/Hz): the loop would push away from the resonance. '
                 f'Fit a rising zero crossing, or check the sideband (invert).')
+        if measured < 0.5 * fitted:
+            # Gains designed for a too small slope are too high by the same
+            # factor; a factor 2-3 already exceeds the loop's gain margin.
+            raise RuntimeError(
+                f'Measured slope {measured:.3g} LSB/Hz is below half the fitted '
+                f'{fitted:.3g} LSB/Hz: the resonance has moved away from the configured '
+                f'frequency. Re-scan, or re-center (recenter_on_tracked) while tracking.')
         if not 1 / 1.5 < measured / fitted < 1.5:
             self.log.warning(f'Measured slope {measured:.3g} LSB/Hz differs from the fitted '
                              f'{fitted:.3g} LSB/Hz; the gains use the measured one.')

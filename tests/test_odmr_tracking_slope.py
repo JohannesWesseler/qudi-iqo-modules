@@ -23,6 +23,15 @@ class CheckedSlopeTest(unittest.TestCase):
         self.assertEqual(slope, 50.0)
         log.warning.assert_called_once()
 
+    def test_much_smaller_slope_is_refused(self):
+        # Seen on the board: the resonance 140 kHz from the configured frequency
+        # gave 14 instead of 40 LSB/Hz, and gains 2.9 times too high oscillated
+        with self.assertRaises(RuntimeError):
+            _check(13.8, 39.6)
+        slope, log = _check(25.0, 39.6)
+        self.assertEqual(slope, 25.0)
+        log.warning.assert_called_once()
+
     def test_falling_error_signal_is_refused(self):
         with self.assertRaises(RuntimeError):
             _check(-47.0, 47.0)

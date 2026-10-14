@@ -35,7 +35,8 @@ def parse_args():
     p.add_argument('--windows', nargs=2, required=True, metavar='LO:HI',
                    help='zero-crossing search window (Hz) of resonance 0 and 1')
     p.add_argument('--runtime', type=float, default=15.0, help='ODMR scan time (s)')
-    p.add_argument('--image-abi-major', type=int, default=4)
+    p.add_argument('--image-abi-major', type=int, default=None,
+                   help="default: the major ABI pyrpl requires (OdmrInstrument)")
     p.add_argument('--out', default=os.path.join(
         os.path.expanduser('~'), 'qudi', 'Data', 'board_tests',
         'tracking_' + time.strftime('%Y%m%d_%H%M%S')))
@@ -135,8 +136,10 @@ def main():
             fw = odmr.check_firmware()
             res['build'] = fw['build']
             log(f"build info {fw['build']}")
+            abi_major = (args.image_abi_major if args.image_abi_major is not None
+                         else odmr.IMAGE_ABI_REQUIRED >> 16)
             checks['build_info'] = (fw['build'] is not None and
-                                    fw['build']['image_abi'] >> 16 == args.image_abi_major
+                                    fw['build']['image_abi'] >> 16 == abi_major
                                     and not fw['build']['git_dirty'])
             phase = logic.get_demod_phase()
             logic.set_demod_phase(phase)
@@ -308,6 +311,10 @@ def main():
             log(f'N=1 closed loop: {st1} {tr1}')
             res['n1_offset_hz'] = offset_hz(tr1[0], slopes[0])
             checks['n1_locked'] = locked(tr1[0], slopes[0])
+            # The resonance drifts by up to ~200 kHz within a minute of the
+            # fit (warming); the following configurations measure the slope at
+            # the configured frequency, so start them where the loop is now.
+            res['recentered_hz'] = logic.recenter_on_tracked()
             logic.stop_tracking()
             logic.stop_streaming()
             wait(1)
@@ -331,6 +338,7 @@ def main():
             checks['n1_pi_stable'] = (bool(pi_settings['proportional']) and
                                       locked(tr_pi[0], slopes[0]) and
                                       tr_pi[0]['err_std'] < 1.2 * tr1[0]['err_std'])
+            logic.recenter_on_tracked()
             logic.stop_tracking()
             logic.stop_streaming()
             wait(1)
