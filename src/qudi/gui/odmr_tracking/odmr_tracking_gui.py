@@ -306,13 +306,22 @@ class OdmrTrackingGui(OdmrGui):
         self._maxcorr_spin = ScienDSpinBox(); self._maxcorr_spin.setRange(1e3, 62.5e6)
         self._maxcorr_spin.setSuffix('Hz'); self._maxcorr_spin.setDecimals(0)
         self._controller_combo = QtWidgets.QComboBox()
-        self._controller_combo.addItem('Integral', 'integral')
-        self._controller_combo.addItem('PI', 'pi')
+        try:
+            controllers = self._odmr_logic().available_controllers
+        except Exception:
+            controllers = {'integral': 'integral only', 'pi': 'PI'}
+        for name, description in controllers.items():
+            label = {'integral': 'Integral', 'pi': 'PI'}.get(name, name.upper())
+            self._controller_combo.addItem(label, name)
+            self._controller_combo.setItemData(
+                self._controller_combo.count() - 1, description, QtCore.Qt.ToolTipRole)
         self._controller_combo.setToolTip(
             'Integral: zero steady-state error; a drifting resonance is followed '
             'with a lag proportional to the drift rate. PI: adds a proportional term '
             '(zero at bandwidth / zero ratio) that damps the loop; with ratio 0.2 it '
-            'allows about 20 % more bandwidth at the same stability margins.')
+            'allows about 20 % more bandwidth at the same stability margins. '
+            'Further entries are controllers of the FPGA image (PII: a second '
+            'integrator, follows a drift without lag).')
         self._zero_ratio_spin = QtWidgets.QDoubleSpinBox()
         self._zero_ratio_spin.setRange(0.1, 30.0); self._zero_ratio_spin.setDecimals(2)
         self._zero_ratio_spin.setToolTip(
@@ -321,7 +330,7 @@ class OdmrTrackingGui(OdmrGui):
             '(the predicted margins are in the log).')
         self._controller_combo.currentIndexChanged.connect(
             lambda _i: self._zero_ratio_spin.setEnabled(
-                self._controller_combo.currentData() == 'pi'))
+                self._controller_combo.currentData() != 'integral'))
         self._read_phase_btn = QtWidgets.QPushButton('← HW')
         self._read_phase_btn.setToolTip(
             'Read the demodulation phase currently set in hardware (shared with ODMR '
@@ -1019,7 +1028,7 @@ class OdmrTrackingGui(OdmrGui):
         idx = self._controller_combo.findData(str(self._gui_controller))
         self._controller_combo.setCurrentIndex(max(idx, 0))
         self._zero_ratio_spin.setValue(float(self._gui_zero_ratio))
-        self._zero_ratio_spin.setEnabled(self._controller_combo.currentData() == 'pi')
+        self._zero_ratio_spin.setEnabled(self._controller_combo.currentData() != 'integral')
         self._detail_points_spin.setValue(int(self._gui_detail_points))
         self._apply_num_resonances(int(self._gui_num_resonances), emit=False)
         # Restore the high-rate trace window and push it to the hardware buffer.

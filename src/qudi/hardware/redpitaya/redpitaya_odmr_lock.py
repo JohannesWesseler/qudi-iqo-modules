@@ -53,6 +53,8 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
                 tracking_algorithm: 'conventional'  # or 'smith_linear'
                 smith_gain_multiplier: 4.0          # increase toward 10 after validation
                 smith_delay_samples: 64
+                controller_options:                 # design options per FPGA controller
+                    pii: {double_ratio: 0.2}
                 max_trace_samples: 2000000   # cap on the high-rate trace buffer
     """
 
@@ -67,6 +69,7 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         'lock_in_filter_resonance_2', default='2kHz_minphase', missing='info')
     _tracking_algorithm = ConfigOption(
         'tracking_algorithm', default='conventional', missing='info')
+    _controller_options = ConfigOption('controller_options', default={}, missing='nothing')
     _smith_gain_multiplier = ConfigOption(
         'smith_gain_multiplier', default=4.0, missing='info')
     _smith_delay_samples = ConfigOption(
@@ -250,20 +253,41 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
     # Controller
     # =========================================================================
 
+    def get_controllers(self) -> Dict[str, str]:
+        """'integral' and 'pi' (the image's pi controller) and the image's
+        other controllers (pyrpl.hardware_modules.freq_lock_controllers)."""
+        out = {'integral': 'integral only', 'pi': 'PI'}
+        if self._lock is not None:
+            for c in self._lock.controllers:
+                if c.name != 'pi':
+                    out[c.name] = c.description
+        return out
+
     def set_bandwidth(self, bandwidth_hz: float, slope_lsb_per_hz: float,
-                      pi: bool = False, zero_ratio: float = 0.2) -> None:
-        """Configure the loop gains (integral-only, or PI if ``pi=True``).
+                      pi: bool = False, zero_ratio: float = 0.2,
+                      controller: Optional[str] = None) -> None:
+        """Configure the loop gains (integral-only, or PI if ``pi=True``, or
+        ``controller``, a name of get_controllers()).
 
         The gains are global (shared by all slots in hardware). With
         ``tracking_algorithm='smith_linear'`` the I+Smith controller is used.
+        A controller of the image other than integral/PI is designed with
+        ``zero_ratio`` and its ``controller_options``.
         """
+        if controller is not None:
+            if controller not in self.get_controllers():
+                raise ValueError(f'unknown controller {controller!r}; the FPGA image '
+                                 f'has {", ".join(self.get_controllers())}')
+            pi = controller == 'pi'
+            if controller in ('integral', 'pi'):
+                controller = None
         if bandwidth_hz <= 0:
             raise ValueError(f'Bandwidth must be positive, got {bandwidth_hz}')
         if slope_lsb_per_hz <= 0:
             raise ValueError(f'Slope must be positive, got {slope_lsb_per_hz}')
 
         if self._tracking_algorithm == 'smith_linear':
-            if pi:
+            if pi or controller is not None:
                 raise ValueError(
                     'smith_linear currently implements the collaborator I+Smith model; '
                     'set pi=False')
@@ -284,6 +308,14 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
                 f'gain=x{float(self._smith_gain_multiplier):.3g}, '
                 f'slope={slope_lsb_per_hz:.3e} LSB/Hz, '
                 f'delay={int(self._lock.smith_delay_samples)} samples')
+        elif controller is not None:
+            options = dict(self._controller_options.get(controller, {}))
+            settings = self._lock.configure(controller, bandwidth_hz, slope_lsb_per_hz,
+                                            zero_ratio=zero_ratio, **options)
+            self.log.info(
+                f'Lock configured ({controller}): BW={bandwidth_hz:.1f} Hz, '
+                f'slope={slope_lsb_per_hz:.3e} LSB/Hz, alpha={zero_ratio:.2f}, '
+                + ', '.join(f'{k}={v:.4g}' for k, v in settings.items()))
         elif pi:
             if not 0.1 <= zero_ratio <= 30.0:
                 raise ValueError(f'Zero ratio must be in [0.1, 30.0], got {zero_ratio}')

@@ -92,7 +92,8 @@ class OdmrTrackingLogic(OdmrLogic):
     _fit_ranges = StatusVar('fit_ranges', default=[(2.86e9, 2.88e9), (2.90e9, 2.92e9)])
     _max_correction_hz_sv = StatusVar('max_correction_hz', default=1.0e6)
     _lock_bandwidth = StatusVar('lock_bandwidth', default=150.0)
-    # 'integral' or 'pi' (zero at bandwidth / zero_ratio)
+    # 'integral', 'pi' (zero at bandwidth / zero_ratio) or another controller
+    # of the hardware (available_controllers)
     _controller = StatusVar('controller', default='integral')
     _zero_ratio = StatusVar('zero_ratio', default=0.2)
 
@@ -487,7 +488,8 @@ class OdmrTrackingLogic(OdmrLogic):
             rep_slope = self._checked_slope(lock_hw.measure_slope(), rep_slope)
         lock_hw.set_bandwidth(float(self._lock_bandwidth), rep_slope,
                               pi=(self._controller == 'pi'),
-                              zero_ratio=float(self._zero_ratio))
+                              zero_ratio=float(self._zero_ratio),
+                              controller=str(self._controller))
         lock_hw.set_max_correction_hz(float(self._max_correction_hz_sv))
 
         self.log.info(
@@ -1224,11 +1226,18 @@ class OdmrTrackingLogic(OdmrLogic):
             self.log.warning(f'Could not read the demodulation phase: {e}')
             return float(self._demod_phase_deg)
 
+    @property
+    def available_controllers(self) -> Dict[str, str]:
+        """{name: description} of the controllers the hardware offers."""
+        return dict(self._tracking_hw().get_controllers())
+
     def set_controller(self, controller: str, zero_ratio: Optional[float] = None) -> None:
-        """'integral' or 'pi' (PI zero at bandwidth / zero_ratio); applied on
-        configure."""
-        if controller not in ('integral', 'pi'):
-            raise ValueError(f"controller must be 'integral' or 'pi', got {controller!r}")
+        """'integral', 'pi' (PI zero at bandwidth / zero_ratio) or another
+        controller of available_controllers; applied on configure."""
+        names = self.available_controllers
+        if controller not in names:
+            raise ValueError(f"controller must be one of {', '.join(names)}, "
+                             f"got {controller!r}")
         if zero_ratio is not None:
             if not 0.1 <= float(zero_ratio) <= 30.0:
                 raise ValueError(f'zero ratio must be in [0.1, 30], got {zero_ratio}')

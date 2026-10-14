@@ -321,19 +321,42 @@ def main():
             st_pi = slot_summary(lock)
             tr_pi = trace_stats(lock, 1)
             k = abs(logic._resonance_slopes[0])
+            pi_settings = odmr.lock.controller.settings()
             res['closed_loop_n1_pi'] = dict(status=st_pi, traces=tr_pi,
-                                            K_Kp=float(odmr.lock.kp_hz_per_lsb) * k)
-            log(f'N=1 PI: K*Kp={odmr.lock.kp_hz_per_lsb * k:.2f}, {st_pi[0]} {tr_pi}')
+                                            K_Kp=float(pi_settings['kp']) * k)
+            log(f'N=1 PI: K*Kp={pi_settings["kp"] * k:.2f}, {st_pi[0]} {tr_pi}')
             # An oscillating loop shows a few hundred times the integral-only
             # error noise, a ringing one (zero ratio 1) about 1.3 times; at 0.2
             # PI is as quiet as integral control.
-            checks['n1_pi_stable'] = (bool(odmr.lock.prop_enable) and
+            checks['n1_pi_stable'] = (bool(pi_settings['proportional']) and
                                       locked(tr_pi[0], slopes[0]) and
                                       tr_pi[0]['err_std'] < 1.2 * tr1[0]['err_std'])
             logic.stop_tracking()
             logic.stop_streaming()
-            logic.set_controller('integral')
             wait(1)
+
+            # 9b. N=1 PII (second integrator), when the image has it
+            if 'pii' in logic.available_controllers:
+                logic.set_controller('pii', 0.2)
+                logic.configure_tracking()
+                logic.start_streaming()
+                logic.start_tracking()
+                wait(8)
+                st_pii = slot_summary(lock)
+                tr_pii = trace_stats(lock, 1)
+                pii_settings = odmr.lock.controller.settings()
+                res['closed_loop_n1_pii'] = dict(status=st_pii, traces=tr_pii,
+                                                 settings=pii_settings,
+                                                 controller=odmr.lock.controller.name)
+                log(f'N=1 PII: {pii_settings}, {st_pii[0]} {tr_pii}')
+                checks['n1_pii_stable'] = (odmr.lock.controller.name == 'pii' and
+                                           not odmr.lock.overrun and
+                                           locked(tr_pii[0], slopes[0]) and
+                                           tr_pii[0]['err_std'] < 1.2 * tr1[0]['err_std'])
+                logic.stop_tracking()
+                logic.stop_streaming()
+                wait(1)
+            logic.set_controller('integral')
 
             # 10. N=2 field logging, with another recording open in parallel
             logic.set_num_resonances(2)

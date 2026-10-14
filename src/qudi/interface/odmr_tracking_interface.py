@@ -53,9 +53,15 @@ class OdmrTrackingInterface(Base):
     # Controller
     # =========================================================================
 
+    def get_controllers(self) -> Dict[str, str]:
+        """Controllers set_bandwidth can use, {name: description}. 'integral'
+        and 'pi' always exist; an FPGA image may add more (e.g. 'pii')."""
+        return {'integral': 'integral only', 'pi': 'PI'}
+
     @abstractmethod
     def set_bandwidth(self, bandwidth_hz: float, slope_lsb_per_hz: float,
-                      pi: bool = False, zero_ratio: float = 0.2) -> None:
+                      pi: bool = False, zero_ratio: float = 0.2,
+                      controller: Optional[str] = None) -> None:
         """
         Set the (global) loop gains for a target bandwidth.
 
@@ -69,6 +75,8 @@ class OdmrTrackingInterface(Base):
                 (PI only). The proportional loop gain is
                 zero_ratio / sqrt(1 + zero_ratio^2) and sets the gain margin
                 against the filter delay: 0.2 is robust, 1 rings.
+            controller: a name of get_controllers(); overrides ``pi``. Other
+                controllers than 'integral' use ``zero_ratio`` too.
         """
         pass
 
