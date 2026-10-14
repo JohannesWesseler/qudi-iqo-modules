@@ -13,7 +13,8 @@ from PySide2 import QtWidgets, QtCore
 from qudi.gui.sensitivity_sweep.sensitivity_sweep_gui import SensitivitySweepGui
 from qudi.logic.sensitivity_sweep_logic import SensitivitySweepLogic
 from qudi.hardware.redpitaya.redpitaya_odmr_lock import RedPitayaOdmrLockHardware
-from pyrpl.hardware_modules.lock_in import _filter_select_options
+from pyrpl.hardware_modules.lock_in import _filter_select_options, _catalog_slots
+from pyrpl.variants import VARIANTS
 from pyrpl.odmr_instrument import OdmrInstrument
 
 
@@ -32,18 +33,13 @@ class TestWideFilters(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
-    def test_old_firmware_does_not_offer_new_register_values(self):
-        old = SimpleNamespace(filter_profile_id=0, filter_capabilities={})
-        self.assertNotIn('6kHz_minphase', _filter_select_options(old, 6))
-        new = SimpleNamespace(filter_profile_id=0, filter_capabilities={
-            '6kHz_minphase': True, '10kHz_minphase': True})
-        self.assertEqual(_filter_select_options(new, 6)['6kHz_minphase'], 2 << 6)
-        self.assertEqual(_filter_select_options(new, 8)['10kHz_minphase'], 3 << 8)
-        fast = SimpleNamespace(filter_profile_id=1)
-        self.assertEqual(list(_filter_select_options(fast, 6)), ['20kHz_linear'])
-        profile2048 = SimpleNamespace(filter_profile_id=2)
-        self.assertEqual(dict(_filter_select_options(profile2048, 6)),
-                         {'10kHz_minphase_2048': 3 << 6})
+    def test_only_the_image_filters_are_offered(self):
+        for variant in ('4096_2k', '1024_20k', '2048_10k'):
+            lockin = SimpleNamespace(filter_slots=_catalog_slots(variant))
+            names = [n for n in _filter_select_options(lockin, 6) if n != '2kHz']
+            self.assertEqual(names, list(VARIANTS[variant].filters))
+        lockin = SimpleNamespace(filter_slots=_catalog_slots('4096_2k'))
+        self.assertEqual(_filter_select_options(lockin, 8)['10kHz_minphase'], 3 << 8)
 
     def test_gui_emits_each_filter_and_logic_applies_it(self):
         for name in ('2kHz_minphase', '2kHz_linear', '20kHz_linear',

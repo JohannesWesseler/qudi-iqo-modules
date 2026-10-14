@@ -1218,12 +1218,12 @@ class SensitivitySweepLogic(LogicBase):
         try:
             demod_filter = lock_hw.get_demod_filter()
             if demod_filter:
-                snapshot['fpga_profile'] = demod_filter['fpga_profile']
+                snapshot['lockin_capabilities'] = demod_filter['capabilities']
                 snapshot['filter_capabilities'] = lock_hw.get_filter_capabilities()
                 snapshot['filter_select_ch1'] = demod_filter['filter']
                 snapshot['fir_bypass_ch1'] = bool(demod_filter['bypass'])
         except Exception as e:
-            snapshot['fpga_profile_error'] = str(e)
+            snapshot['lockin_capabilities_error'] = str(e)
         return json_safe(snapshot)
 
     def _raw_discriminator_slope(self, fitted_slope: float) -> Tuple[float, float]:

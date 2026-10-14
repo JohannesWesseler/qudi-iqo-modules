@@ -165,7 +165,8 @@ class OdmrTrackingInterface(Base):
         """
         Filter of resonance 0's tracked lane: dict with 'filter' (str),
         'bypass' (bool), 'smith_filter' (filter a predictor model assumes, or
-        None), 'fpga_profile' (dict). Empty if the filter is fixed.
+        None), 'capabilities' (dict: the lock-in's filter slots and timing).
+        Empty if the filter is fixed.
         """
         return {}
 

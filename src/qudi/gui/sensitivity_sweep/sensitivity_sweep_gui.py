@@ -27,6 +27,7 @@ __all__ = ['SensitivitySweepGui']
 import numpy as np
 import pyqtgraph as pg
 from PySide2 import QtCore, QtWidgets, QtGui
+from pyrpl import variants as pyrpl_variants
 
 from qudi.core.connector import Connector
 from qudi.core.statusvariable import StatusVar
@@ -454,27 +455,19 @@ class SensitivitySweepGui(GuiBase):
         )
         stream_layout.addRow(self._fir_bypass_checkbox)
 
+        # Every filter of the pyrpl catalog; the logic falls back to the image's
+        # default filter when the loaded variant lacks the chosen one.
         self._fir_filter_combobox = QtWidgets.QComboBox()
-        self._fir_filter_combobox.addItems([
-            '2 kHz minimum phase',
-            '2 kHz linear phase',
-            '20 kHz linear phase (fast /1024 image)',
-            '6 kHz minimum phase',
-            '10 kHz minimum phase',
-            '10 kHz minimum phase (CIC /2048, N=3, M=1)',
-        ])
-        # Map stored value to combobox index
-        _filter_index_map = {
-            '2kHz_minphase': 0,
-            '2kHz_linear': 1,
-            '20kHz_linear': 2,
-            '6kHz_minphase': 3,
-            '10kHz_minphase': 4,
-            '10kHz_minphase_2048': 5,
-            '2kHz': 0,  # migrate the legacy minimum-phase spelling
-        }
-        filter_index = _filter_index_map.get(self._fir_filter_bandwidth, 0)
-        self._fir_filter_combobox.setCurrentIndex(filter_index)
+        for f in pyrpl_variants.FILTERS.values():
+            phase = 'linear' if f.linear_phase else 'minimum'
+            self._fir_filter_combobox.addItem(
+                f'{f.corner_hz / 1e3:g} kHz {phase} phase ({f.name})', f.name)
+        try:
+            stored = pyrpl_variants.filter_by_name(self._fir_filter_bandwidth).name
+        except KeyError:
+            stored = '2kHz_minphase'
+        self._fir_filter_combobox.setCurrentIndex(
+            max(self._fir_filter_combobox.findData(stored), 0))
         self._fir_filter_combobox.setToolTip(
             'Select lock-in lowpass filter.\n'
             'Only filters compiled into the loaded image can be selected.\n'
@@ -1002,13 +995,7 @@ class SensitivitySweepGui(GuiBase):
 
         # Lock-in filter settings
         self._fir_bypass = self._fir_bypass_checkbox.isChecked()
-        # Map combobox index to PyRPL register key
-        _filter_key_from_index = {
-            0: '2kHz_minphase', 1: '2kHz_linear', 2: '20kHz_linear',
-            3: '6kHz_minphase', 4: '10kHz_minphase', 5: '10kHz_minphase_2048'}
-        self._fir_filter_bandwidth = _filter_key_from_index.get(
-            self._fir_filter_combobox.currentIndex(), '2kHz_minphase'
-        )
+        self._fir_filter_bandwidth = self._fir_filter_combobox.currentData() or '2kHz_minphase'
         if self._fir_filter_bandwidth == '10kHz_minphase_2048':
             self._stream_f_enbw = 10640.924904046242
 
@@ -1163,7 +1150,7 @@ class SensitivitySweepGui(GuiBase):
 
     def _update_filter_comparison(self, *args):
         compare = self._compare_filters_checkbox.isChecked()
-        new_profile = self._fir_filter_combobox.currentIndex() == 5
+        new_profile = self._fir_filter_combobox.currentData() == '10kHz_minphase_2048'
         if new_profile:
             self._measure_smith_checkbox.setChecked(False)
             self._stream_f_enbw_spinbox.setValue(10640.924904046242)

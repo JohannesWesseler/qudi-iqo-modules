@@ -25,6 +25,7 @@ qudi. If not, see <https://www.gnu.org/licenses/>.
 import threading
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
+from pyrpl import variants as pyrpl_variants
 from qudi.core.configoption import ConfigOption
 from qudi.interface.odmr_tracking_interface import OdmrTrackingInterface
 from qudi.hardware.redpitaya.resource_manager import get_pyrpl_instance, release_pyrpl_instance
@@ -198,13 +199,8 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         if self._odmr is not None:
             self._configured_lock_in_filters = [
                 self._odmr.demod_filter(chain)['filter'] for chain in (0, 1)]
-        minphase_gain = 937716.0 / (2 ** 21)
-        linear_gain = (802861.0 / (2 ** 21)) * (299.0 / 256.0)
-        fast_linear_gain = 200955.0 / (2 ** 21)
-        wide_minphase_gain = 7326.0 / (2 ** 14)
-        gains = [fast_linear_gain if name == '20kHz_linear' else
-                 wide_minphase_gain if name in ('6kHz_minphase', '10kHz_minphase', '10kHz_minphase_2048') else
-                 linear_gain if name == '2kHz_linear' else minphase_gain
+        # The image reports the same per-filter DC gain from the catalog
+        gains = [pyrpl_variants.filter_by_name(name).dc_gain()
                  for name in self._configured_lock_in_filters]
         return {
             'filters': tuple(self._configured_lock_in_filters[:self._nslots]),
