@@ -1,0 +1,28 @@
+{
+  "stage": 7,
+  "f": 80000.0,
+  "amp": 0.684,
+  "duration": 600.0,
+  "dt": 1.0,
+  "offset_null": -0.000794,
+  "note": "Stage 7: thermal run, 80 kHz, OUT1 0.684 V (last clean Stage-5 point, ~0.99 A, ~0.59 mT) for 10 min.\n\nBefore and after: 1 kHz reference at 0.2 A (Re Z ~ R10 + coil + leads + shunt, gives the\nresistance rise from warming). Main run: ramp 0 -> 0.684 V in <= 25 % steps (measure after\neach), then log I, |Z|, phase, Re Z and rail currents every 1 s for 600 s (10 s on the first run). Abort if I drifts\n> 5 % from the first logged value. Ramp down, OUT1 off, rails off.\n",
+  "started": "2026-11-06T13:06:57",
+  "saved": "2026-11-06T13:17:17",
+  "result": {
+    "i_start": 0.9871469976928905,
+    "i_end": 0.9864154169053618,
+    "i_drift_pct": -0.07411062275816116,
+    "zre_start": 4.19998078124667,
+    "zre_end": 4.205083072787333,
+    "zre_change_pct": 0.12148368781697005,
+    "zabs_change_pct": 0.043590918184377436,
+    "phase_change_deg": 0.018252607176634683,
+    "rails_end_A": [
+      0.314,
+      0.314
+    ],
+    "ref1k_re_before": 3.4037619770045473,
+    "ref1k_re_after": 3.405024829176789,
+    "ref1k_change_pct": 0.03710165930441711
+  }
+}

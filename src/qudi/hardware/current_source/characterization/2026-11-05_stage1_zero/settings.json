@@ -1,0 +1,23 @@
+{
+  "stage": 1,
+  "note": "OUT1 func DC, amplitude 0; offset sweep +-5 mV",
+  "started": "2026-11-05T21:13:55",
+  "fit_in1": [
+    2.345109553508576,
+    0.0018032034238179525
+  ],
+  "fit_mon": [
+    1.0087827267794354,
+    0.001146908455035266
+  ],
+  "v_null": -0.0007689207615568047,
+  "v_null_applied": -0.0007689207615568047,
+  "r_dc_from_slopes": 3.441315482324212,
+  "saved": "2026-11-05T21:14:32",
+  "corrected_null": {
+    "v_null": -0.000794,
+    "adc_offset_shunt": -6e-05,
+    "adc_offset_mon": 0.00034,
+    "note": "null includes RP shunt-channel ADC offset (-0.06 mV, unpowered baseline); amplifier output offset +12.6 mV; I(OUT1=0) = +3.7 mA"
+  }
+}

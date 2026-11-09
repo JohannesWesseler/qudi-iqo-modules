@@ -1,0 +1,16 @@
+{
+ "description": "Red Pitaya RP2 (STEMlab 125-14 LN, 10.203.129.30) + LM1875 driver board (perfboard, Nov 2026)",
+ "measured": "2026-11-05 (characterization Stage 1); input assignment checked 2026-11-08",
+ "offset_null": -0.000794,
+ "offset_null_note": "OUT1 offset (V) that nulls the load current; without it the amplifier output offset (+12.6 mV) drives +3.7 mA into the Helmholtz load (residual after nulling ~0.2 mA)",
+ "adc_offsets": [
+  0.00034,
+  -6e-05
+ ],
+ "adc_offsets_note": "V, physical inputs [IN1, IN2], board unpowered. Measured with the cables swapped (shunt on IN2 then), so IN1 = 3.4e-4, IN2 = -6e-5",
+ "out1_clean": 0.76,
+ "out1_max": 0.81,
+ "out1_note": "OUT1 amplitude + |offset| (V). Clean up to 0.758 V at 50-80 kHz; at 0.81 V HF bursts at the negative output peak (output ~13 V, near the -16 V rail). Above out1_clean only with allow_near_rail",
+ "gain_large_signal": 16.35,
+ "gain_note": "output / OUT1 above ~0.15 V on OUT1 (nominal 16 = 1 + 15k/1k). Below ~30 mV the gain is up to 6 % lower and the phase shifts by ~1-1.5 deg (class-AB crossover); documentation only"
+}

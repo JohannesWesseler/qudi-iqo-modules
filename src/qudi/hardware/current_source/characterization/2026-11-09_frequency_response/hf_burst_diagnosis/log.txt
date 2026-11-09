@@ -1,0 +1,25 @@
+[16:27:36] supply on
+[16:27:40] 42.17 kHz 0.5 A ok: gm 2.4370 -68.10 deg, i_resid 9.36 mA
+[16:27:40] ok_42k_500mA: shunt peak +0.307 V at t = 10.26 us (0.43 periods; burst None periods), MON at that time +0.121 V, MON peak 0.209 V, expected shunt peak 0.250 V
+[16:27:43] 42.17 kHz 0.6 A ok: gm 2.4383 -68.08 deg, i_resid 11.00 mA
+[16:27:43] ok_42k_600mA: shunt peak +0.370 V at t = 10.29 us (0.43 periods; burst None periods), MON at that time +0.143 V, MON peak 0.251 V, expected shunt peak 0.300 V
+[16:27:47] 42.17 kHz 0.7 A ok: gm 2.4376 -68.11 deg, i_resid 13.50 mA
+[16:27:47] ok_42k_700mA: shunt peak +0.433 V at t = 10.10 us (0.43 periods; burst None periods), MON at that time +0.179 V, MON peak 0.292 V, expected shunt peak 0.350 V
+[16:27:51] 42.17 kHz 0.8 A ok: gm 2.4382 -68.09 deg, i_resid 16.86 mA
+[16:27:51] ok_42k_800mA: shunt peak +0.496 V at t = 10.37 us (0.44 periods; burst None periods), MON at that time +0.185 V, MON peak 0.334 V, expected shunt peak 0.400 V
+[16:27:55] 42.17 kHz 0.9 A ok: gm 2.4389 -68.10 deg, i_resid 20.68 mA
+[16:27:55] ok_42k_900mA: shunt peak +0.560 V at t = 10.11 us (0.43 periods; burst None periods), MON at that time +0.229 V, MON peak 0.376 V, expected shunt peak 0.450 V
+[16:27:56] 42.17 kHz 1.0 A: CurrentSourceAbort: shunt peak 1.064 V > 0.896 V
+[16:27:56] abort_42k_1000mA: shunt peak +1.064 V at t = 13.54 us (0.57 periods; burst None periods), MON at that time -0.126 V, MON peak 0.417 V, expected shunt peak 0.500 V
+[16:28:00] 35.00 kHz 1.00 A ok, i_resid 21.63 mA
+[16:28:00] ok_35k_1000mA: shunt peak +0.594 V at t = 11.89 us (0.42 periods; burst None periods), MON at that time +0.232 V, MON peak 0.368 V, expected shunt peak 0.500 V
+[16:28:01] 42.17 kHz 1.00 A: CurrentSourceAbort: shunt peak 1.064 V > 0.896 V
+[16:28:01] abort_42k_1000mA: shunt peak +1.064 V at t = 13.94 us (0.59 periods; burst None periods), MON at that time -0.159 V, MON peak 0.417 V, expected shunt peak 0.500 V
+[16:28:02] 50.00 kHz 1.00 A: CurrentSourceAbort: shunt peak 1.064 V > 0.896 V
+[16:28:02] abort_50k_1000mA: shunt peak +1.064 V at t = 12.51 us (0.63 periods; burst None periods), MON at that time -0.275 V, MON peak 0.476 V, expected shunt peak 0.500 V
+[16:28:03] 60.00 kHz 1.00 A: CurrentSourceAbort: shunt peak 1.064 V > 0.896 V
+[16:28:03] abort_60k_1000mA: shunt peak +1.064 V at t = 10.03 us (0.60 periods; burst None periods), MON at that time -0.217 V, MON peak 0.563 V, expected shunt peak 0.500 V
+[16:28:04] 75.00 kHz 1.00 A: CurrentSourceAbort: shunt peak 1.064 V > 0.896 V
+[16:28:04] abort_75k_1000mA: shunt peak +1.064 V at t = 8.14 us (0.61 periods; burst None periods), MON at that time -0.264 V, MON peak 0.688 V, expected shunt peak 0.500 V
+[16:28:04] output and supply off
+[16:28:05] RESULT OK

@@ -1,0 +1,130 @@
+{
+  "stage": 8,
+  "n_avg": {
+    "8192": 32,
+    "256": 160
+  },
+  "offset_null": {
+    "v_null": -0.000794,
+    "adc_offset_shunt": -6e-05,
+    "adc_offset_mon": 0.00034,
+    "note": "null includes RP shunt-channel ADC offset (-0.06 mV, unpowered baseline); amplifier output offset +12.6 mV; I(OUT1=0) = +3.7 mA"
+  },
+  "note": "Stage 8: idle noise of the coil current, 10 Hz - 100 kHz, in A/sqrt(Hz).\n\nStates: (a) rails on, OUT1 off; (b) rails on, OUT1 on at the null offset (amplitude 0);\n(c) rails OFF (board unpowered, coil connected) = Red Pitaya input noise reference.\n(c) also ends the session: OUT1 to 0 and off first, then Ch1/Ch4 off.\nTwo decimations: 8192 (15.3 kS/s, 1.07 s buffer) for 10 Hz-7 kHz and 256 (488 kS/s) for 1-200 kHz.\n",
+  "started": "2026-11-06T13:17:18",
+  "ngp_after": {
+    "master": 1,
+    "selected": 1,
+    "channels": [
+      {
+        "ch": 1,
+        "v_set": 16.0,
+        "i_set": 2.1,
+        "sel": 0,
+        "out": 0,
+        "fuse": 1,
+        "fuse_del": 0.05,
+        "fuse_del_init": 0.1,
+        "fuse_trip": 0,
+        "v_meas": 0.002,
+        "i_meas": 0.0005
+      },
+      {
+        "ch": 2,
+        "v_set": 1.0,
+        "i_set": 0.001,
+        "sel": 0,
+        "out": 0,
+        "fuse": 0,
+        "fuse_del": 0.0,
+        "fuse_del_init": 0.0,
+        "fuse_trip": 0,
+        "v_meas": 0.0,
+        "i_meas": 0.0
+      },
+      {
+        "ch": 3,
+        "v_set": 1.0,
+        "i_set": 0.03,
+        "sel": 1,
+        "out": 1,
+        "fuse": 0,
+        "fuse_del": 0.0,
+        "fuse_del_init": 0.0,
+        "fuse_trip": 0,
+        "v_meas": 1.001,
+        "i_meas": 0.022
+      },
+      {
+        "ch": 4,
+        "v_set": 16.0,
+        "i_set": 2.1,
+        "sel": 0,
+        "out": 0,
+        "fuse": 1,
+        "fuse_del": 0.05,
+        "fuse_del_init": 0.1,
+        "fuse_trip": 0,
+        "v_meas": 0.002,
+        "i_meas": 0.001
+      }
+    ]
+  },
+  "saved": "2026-11-06T13:22:33",
+  "bands": {
+    "unpowered": {
+      "10-100 Hz": {
+        "median_A_rtHz": 8.47564571909877e-06,
+        "rms_A": 9.566978426368184e-05
+      },
+      "100-1000 Hz": {
+        "median_A_rtHz": 2.019069191503231e-06,
+        "rms_A": 7.796681001491208e-05
+      },
+      "1000-10000 Hz": {
+        "median_A_rtHz": 4.6945034650803924e-07,
+        "rms_A": 5.3660163086294494e-05
+      },
+      "10000-100000 Hz": {
+        "median_A_rtHz": 3.199409208113525e-07,
+        "rms_A": 0.00010659139427804038
+      }
+    },
+    "out1_off": {
+      "10-100 Hz": {
+        "median_A_rtHz": 3.7574243128448183e-06,
+        "rms_A": 4.0433183486536136e-05
+      },
+      "100-1000 Hz": {
+        "median_A_rtHz": 1.9683585660199615e-06,
+        "rms_A": 6.354623083123866e-05
+      },
+      "1000-10000 Hz": {
+        "median_A_rtHz": 1.6062033742300403e-06,
+        "rms_A": 0.00015283076951111679
+      },
+      "10000-100000 Hz": {
+        "median_A_rtHz": 7.097425447484234e-07,
+        "rms_A": 0.00034182262103019725
+      }
+    },
+    "out1_on_0": {
+      "10-100 Hz": {
+        "median_A_rtHz": 6.065127953378961e-06,
+        "rms_A": 6.208922759072945e-05
+      },
+      "100-1000 Hz": {
+        "median_A_rtHz": 2.2089221321515193e-06,
+        "rms_A": 7.52791236459839e-05
+      },
+      "1000-10000 Hz": {
+        "median_A_rtHz": 1.5220487307931654e-06,
+        "rms_A": 0.00014532143027073033
+      },
+      "10000-100000 Hz": {
+        "median_A_rtHz": 6.339758899353427e-07,
+        "rms_A": 0.00031818262355385923
+      }
+    }
+  }
+}

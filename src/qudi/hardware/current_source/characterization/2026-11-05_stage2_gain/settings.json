@@ -1,0 +1,17 @@
+{
+  "stage": 2,
+  "offset_null": {
+    "v_null": -0.000794,
+    "adc_offset_shunt": -6e-05,
+    "adc_offset_mon": 0.00034,
+    "note": "null includes RP shunt-channel ADC offset (-0.06 mV, unpowered baseline); amplifier output offset +12.6 mV; I(OUT1=0) = +3.7 mA"
+  },
+  "started": "2026-11-05T21:15:40",
+  "dc_summary": {
+    "mon_gain": 1.012388750910759,
+    "gm": 4.751650422811508,
+    "r_dc": 3.408967111050186,
+    "note": "r_dc corrected (printout divided by 2 twice)"
+  },
+  "saved": "2026-11-05T21:15:56"
+}

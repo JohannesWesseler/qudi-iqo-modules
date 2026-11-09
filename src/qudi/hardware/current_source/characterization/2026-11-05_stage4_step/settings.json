@@ -1,0 +1,47 @@
+{
+  "stage": 4,
+  "i_target": 0.2,
+  "offset_null": {
+    "v_null": -0.000794,
+    "adc_offset_shunt": -6e-05,
+    "adc_offset_mon": 0.00034,
+    "note": "null includes RP shunt-channel ADC offset (-0.06 mV, unpowered baseline); amplifier output offset +12.6 mV; I(OUT1=0) = +3.7 mA"
+  },
+  "note": "Stage 4: step response, 1 kHz square, +-0.2 A. Edge-triggered captures (MON rising edge),\n10 coherent averages at dec 1 (8 ns) and dec 8 (64 ns).",
+  "started": "2026-11-05T21:24:05",
+  "gen_rise_fall_us": [
+    "0.1",
+    "0.1"
+  ],
+  "saved": "2026-11-05T21:24:14",
+  "analysis": {
+    "1": {
+      "fs": 125000000.0,
+      "i_before": -0.20244776329045258,
+      "i_final_fit": 0.19929437331894695,
+      "v_before": -0.6923191210089895,
+      "v_after": 0.6830078125,
+      "mon_overshoot": -0.0009940818191582674,
+      "mon_rise_10_90_ns": 479.99999999999994,
+      "tau_us": 6.236778955848936,
+      "tau_err_us": 0.002580766365663284,
+      "i_fit_resid_rms_mA": 1.3168532916365718,
+      "i_rise_10_90_us": 13.702203366000113,
+      "mon_ripple_pp_after_edge_mV": 42.8466796875
+    },
+    "8": {
+      "fs": 15625000.0,
+      "i_before": -0.202453098122133,
+      "i_final_fit": 0.1996739472586856,
+      "v_before": -0.693556240443425,
+      "v_after": 0.6833984375,
+      "mon_overshoot": -0.004397158161402247,
+      "mon_rise_10_90_ns": 448.0,
+      "tau_us": 6.260211266025247,
+      "tau_err_us": 0.00249843204858377,
+      "i_fit_resid_rms_mA": 0.5087274184281021,
+      "i_rise_10_90_us": 13.753684151457469,
+      "mon_ripple_pp_after_edge_mV": 35.6689453125
+    }
+  }
+}

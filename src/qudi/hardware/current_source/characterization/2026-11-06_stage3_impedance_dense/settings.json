@@ -1,0 +1,26 @@
+{
+  "stage": 3,
+  "i_target": 0.2,
+  "offset_null": {
+    "v_null": -0.000794,
+    "adc_offset_shunt": -6e-05,
+    "adc_offset_mon": 0.00034,
+    "note": "null includes RP shunt-channel ADC offset (-0.06 mV, unpowered baseline); amplifier output offset +12.6 mV; I(OUT1=0) = +3.7 mA"
+  },
+  "note": "Stage 3: small-signal impedance sweep, 0.2 A peak, 100 log points 100 Hz - 100 kHz\n(25 points on 2026-11-05).\n\nPer point: amplitude 0 at f -> ramp (<= 25 %/step) -> at ~0.5x target, 5 acquisitions\ntriggered on the generator start (AWG_PE; restarts the sine at phase 0, step <= 0.5x target)\ngive MON and current phase vs OUT1 -> ramp to target, trim to 0.2 A, 5 free-running\nacquisitions (lock-in) -> ramp down.\n",
+  "started": "2026-11-06T12:33:20",
+  "saved": "2026-11-06T12:42:11",
+  "fit": {
+    "L_fit_uH": 20.45552760804841,
+    "R0": 3.4188743766347924,
+    "R_f2_coef": 1.2362248003690993e-10,
+    "R_at_80k": 4.210058248871016,
+    "L_lin_uH": 20.52344211765742,
+    "X0": -0.02210062450707584,
+    "R_mean_lowf": 3.4026443714230243,
+    "mon_gain_lowf": 1.0053765502148007,
+    "amp_fc_kHz": 734.8361862962965,
+    "amp_fc_err_kHz": 94.9781200681396,
+    "residual_delay_us": 0.47464948128071693
+  }
+}
