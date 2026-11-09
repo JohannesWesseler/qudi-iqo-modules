@@ -66,11 +66,21 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             iq0_phase_offset: 0.0  # IQ demodulation phase offset in degrees (adjust for max 1f signal)
             multi_frequency_mode: 'triple'  # Options: 'single', 'dual', 'triple'
             multi_frequency_amplitudes: [0.1, 0.1, 0.1]  # RELATIVE amplitudes for multi-freq mode
+            windfreak_reference: 'internal_27MHz'  # 'internal_27MHz', 'internal_10MHz' or 'external'
+            # windfreak_reference_frequency_mhz: 10.0  # required for 'external'
+
+    The Windfreak reference (command x) and its PLL reference frequency (command *)
+    are written on activation, and the PLL lock is checked on activation and every
+    time the output is switched on. A reference frequency that does not match the
+    selected reference leaves the PLL unlocked: no usable microwave output.
     """
 
     # Windfreak config options
     _windfreak_serial_port = ConfigOption('windfreak_serial_port', missing='error')
     _windfreak_comm_timeout = ConfigOption('windfreak_comm_timeout', default=10, missing='warn')
+    _windfreak_reference = ConfigOption('windfreak_reference', default='internal_27MHz', missing='info')
+    _windfreak_reference_frequency_mhz = ConfigOption(
+        'windfreak_reference_frequency_mhz', default=None, missing='nothing')
 
     # Red Pitaya config options
     _redpitaya_hostname = ConfigOption('redpitaya_hostname', missing='error')
@@ -218,8 +228,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 write_termination='\n',
                 timeout=int(self._windfreak_comm_timeout * 1000)
             )
-            self._windfreak_model = self._windfreak_device.query('+')
+            self._windfreak_drain()
+            self._windfreak_model = self._windfreak_query('+')
             self.log.info(f'Connected to Windfreak: {self._windfreak_model}')
+            # Reference and PLL reference frequency explicitly, then check the lock
+            self._windfreak_apply_reference()
 
             # Connect to Red Pitaya
             self._redpitaya = RedPitayaIFSource(self._redpitaya_hostname, self._redpitaya_port)
@@ -400,7 +413,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         @return float: The currently set CW microwave frequency in Hz.
         """
         with self._thread_lock:
-            lo_frequency = float(self._windfreak_device.query('f?')) * 1e6
+            lo_frequency = float(self._windfreak_query('f?')) * 1e6
             return self._lo_to_rf_frequency(lo_frequency)
 
     @property
@@ -864,20 +877,102 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         return self._windfreak_stat()
 
     def _windfreak_on(self):
-        """Turn on Windfreak output."""
+        """Turn on Windfreak output (and check that the PLL is locked)."""
         self._windfreak_device.write(f'W{self._lo_power}')
         self._windfreak_device.write('E1h1')
+        if not self._windfreak_pll_locked():
+            self.log.warning('Windfreak PLL unlocked when switching on; re-applying the reference.')
+            self._windfreak_apply_reference()
         return self._windfreak_stat()
 
     def _windfreak_stat(self):
         """Return Windfreak status."""
         try:
-            E = int(self._windfreak_device.query('E?'))
-            h = int(self._windfreak_device.query('h?'))
+            E = int(self._windfreak_query('E?'))
+            h = int(self._windfreak_query('h?'))
             return E, h
         except Exception as e:
             self.log.error(f'Failed to get Windfreak status: {e}')
             return 0, 0
+
+    # --- Windfreak serial helpers --------------------------------------------
+    def _windfreak_drain(self):
+        """Discard unread reply lines. Some queries (e.g. p?, z?) are answered with
+        the value followed by the whole help menu; unread lines would otherwise be
+        taken as the answers to the next queries."""
+        dev = self._windfreak_device
+        old = dev.timeout
+        dev.timeout = 50
+        try:
+            for _ in range(200):
+                dev.read()
+        except Exception:
+            pass
+        finally:
+            dev.timeout = old
+
+    def _windfreak_query(self, cmd):
+        """Query one value: drain stale lines first, take the first reply line,
+        drain whatever follows it."""
+        self._windfreak_drain()
+        reply = self._windfreak_device.query(cmd).strip()
+        self._windfreak_drain()
+        return reply
+
+    def _windfreak_reference_setting(self):
+        """(x command value, PLL reference frequency in MHz) from the config."""
+        ref = str(self._windfreak_reference).strip().lower()
+        if ref in ('internal_27mhz', 'internal27', '27mhz', 'internal'):
+            return 1, 27.0
+        if ref in ('internal_10mhz', 'internal10', '10mhz'):
+            return 2, 10.0
+        if ref == 'external':
+            if self._windfreak_reference_frequency_mhz is None:
+                raise ValueError('windfreak_reference "external" needs windfreak_reference_frequency_mhz')
+            return 0, float(self._windfreak_reference_frequency_mhz)
+        raise ValueError(f'unknown windfreak_reference {self._windfreak_reference!r}; use '
+                         '"internal_27MHz", "internal_10MHz" or "external"')
+
+    def _windfreak_pll_locked(self, timeout=0.5):
+        """True if the Windfreak PLL reports lock (polled up to timeout seconds)."""
+        t_end = time.monotonic() + timeout
+        while True:
+            try:
+                if self._windfreak_query('p?').startswith('1'):
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() > t_end:
+                return False
+            time.sleep(0.05)
+
+    def _windfreak_apply_reference(self):
+        """Write the reference (x) and the matching PLL reference frequency (*),
+        verify both, and check the PLL lock. Logs an error if the PLL stays unlocked."""
+        x, f_ref = self._windfreak_reference_setting()
+        self._windfreak_device.write(f'x{x}')
+        self._windfreak_device.write(f'*{f_ref:.8f}')
+        # re-set the current frequency so the PLL re-locks with the new reference
+        try:
+            f_now = float(self._windfreak_query('f?'))
+            self._windfreak_device.write(f'f{f_now:.8f}')
+        except Exception:
+            pass
+        try:
+            x_rb = self._windfreak_query('x?')
+            f_rb = float(self._windfreak_query('*?'))
+        except Exception as e:
+            self.log.error(f'Windfreak reference readback failed: {e}')
+            return False
+        locked = self._windfreak_pll_locked(timeout=1.0)
+        msg = (f'Windfreak reference x={x_rb} (set {x}), PLL reference {f_rb:.3f} MHz '
+               f'(set {f_ref:.3f}), PLL {"locked" if locked else "UNLOCKED"}')
+        if locked and x_rb.startswith(str(x)) and abs(f_rb - f_ref) < 1e-3:
+            self.log.info(msg)
+        else:
+            self.log.error(msg + ' - no usable microwave output while unlocked. Check the '
+                                 'reference settings (and the external reference, if used).')
+        return locked
 
     def _power_to_if_amplitude(self, power_dbm):
         """Convert requested power (dBm) to Red Pitaya IF amplitude.
@@ -1055,7 +1150,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             # Calculate actual RF frequencies for each IF component
             if self.module_state() != 'idle':
                 try:
-                    lo_freq = float(self._windfreak_device.query('f?')) * 1e6
+                    lo_freq = float(self._windfreak_query('f?')) * 1e6
                     if self._sideband == 'upper':
                         rf_frequencies = [lo_freq + if_freq for if_freq in self._active_if_frequencies]
                     else:
