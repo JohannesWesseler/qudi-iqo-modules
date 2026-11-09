@@ -331,6 +331,16 @@ class OdmrTrackingInterface(Base):
         """
         pass
 
+    # Optional (not abstract): what the y_position marker of recordings records.
+    def set_marker_input(self, mode: str) -> None:
+        """'kdc' (y = KDC101 slow-axis trigger, default), 'sync' (y = external sync
+        marker, e.g. the current source's generator trigger) or 'both' (sync events
+        flagged). Raises NotImplementedError if the hardware has no sync input."""
+        raise NotImplementedError('this tracking hardware has no sync-marker input')
+
+    def get_marker_input(self) -> str:
+        return 'kdc'
+
     @abstractmethod
     def close_recording(self, handle: int) -> Dict[str, Any]:
         """Stop a recording (idempotent); returns transport/FPGA statistics."""

@@ -846,6 +846,25 @@ class RedPitayaOdmrLockHardware(OdmrTrackingInterface):
         return (index[markers['source'] == ids['x_position']].astype(np.int64),
                 index[markers['source'] == ids['y_position']].astype(np.int64))
 
+    def set_marker_input(self, mode: str) -> None:
+        """What the y_position marker records: 'kdc' (DIO6_P, KDC101 slow axis;
+        reset default), 'sync' (DIO0_N, external sync marker such as the current
+        source's generator trigger) or 'both' (sync events carry flag bit 2).
+        Needs an image with the sync input (data streamer ABI 1.5)."""
+        if mode not in ('kdc', 'sync', 'both'):
+            raise ValueError("marker input must be 'kdc', 'sync' or 'both'")
+        self._require_active()
+        if not getattr(self._streamer, 'sync_marker_available', False):
+            raise RuntimeError('the loaded FPGA image has no sync-marker input '
+                               '(data streamer ABI 1.5, pyrpl branch coil_sync)')
+        self._streamer.y_marker_input = mode
+        self.log.info(f'y_position marker records: {mode}')
+
+    def get_marker_input(self) -> str:
+        if not getattr(self._streamer, 'sync_marker_available', False):
+            return 'kdc'
+        return str(self._streamer.y_marker_input)
+
     def close_recording(self, handle: int) -> Dict[str, Any]:
         """Close a recording; returns its transport and FPGA statistics."""
         with self._recording_lock:
